@@ -43,7 +43,7 @@ USE_BAD_WEATHER_ONLY = False   # 全天候で処理
 IOU_THRESH = 0.10
 RADAR_MIN_PTS = 1
 NSWEEPS = 5
-YOLO_MODEL = "yolov8s.pt"
+YOLO_MODEL = "yolov8n.pt"  # default model (can be overridden by --yolo-model)
 VEHICLE_CLASS_IDS = {1,2,3,5,7}
 MAX_SCENES = None
 
@@ -118,6 +118,17 @@ def _center(box):
 
 def _contains(box, x, y):
     return (box["x1"] <= x <= box["x2"]) and (box["y1"] <= y <= box["y2"])
+
+# === CLI arguments ===
+def _parse_args():
+    p = argparse.ArgumentParser(description="Radar-guided ROI vehicle detection (NuScenes)")
+    p.add_argument("--yolo-model", default=os.environ.get("YOLO_MODEL", YOLO_MODEL),
+                   help="Ultralytics YOLO weights (e.g., yolov8n.pt, yolov8s.pt, custom.pt). Env YOLO_MODEL also respected.")
+    p.add_argument("--conf", type=float, default=YOLO_CONF,
+                   help="YOLO confidence threshold (default from YOLO_CONF).")
+    p.add_argument("--device", default=None,
+                   help="Torch device for YOLO (e.g., 'cuda:0', 'mps', 'cpu'). If omitted, Ultralytics default is used.")
+    return p.parse_args()
 
 
 # === 天候タグ（ざっくり分類：可視化用） ===
@@ -564,6 +575,12 @@ def filter_scenes(nusc: NuScenes):
 # ================== メイン ==================
 
 def main():
+    # parse CLI options and override defaults
+    args = _parse_args()
+    global YOLO_MODEL, YOLO_CONF
+    YOLO_MODEL = args.yolo_model
+    YOLO_CONF = args.conf
+
     print("[1/7] Load NuScenes...")
     nusc = NuScenes(version=NUSC_VERSION, dataroot=PRIMARY_DATAROOT, verbose=True)
     print("[2/7] Patch path resolver...")
@@ -578,6 +595,11 @@ def main():
 
     print("[4/7] Load YOLO...")
     model = YOLO(YOLO_MODEL)
+    if args.device:
+        try:
+            model.to(args.device)
+        except Exception as _e:
+            print(f"[warn] Could not move model to device '{args.device}': {_e}. Using default device.", flush=True)
 
     # 結果集計用
     total_pairs = 0
@@ -596,7 +618,10 @@ def main():
     weather_scene_counts = {}
 
     print("[5/7] Iterate samples & measure timing...")
-    print(f"  CONFIG: IOU_THRESH={IOU_THRESH} NSWEEPS={NSWEEPS} RADAR_MIN_PTS={RADAR_MIN_PTS} YOLO_MODEL={YOLO_MODEL} YOLO_CONF={YOLO_CONF} USE_ROI={USE_ROI} [BUILD {BUILD_ID}]", flush=True)
+    dev_str = getattr(args, "device", None) or "auto"
+    print(f"  CONFIG: IOU_THRESH={IOU_THRESH} NSWEEPS={NSWEEPS} RADAR_MIN_PTS={RADAR_MIN_PTS} "
+          f"YOLO_MODEL={YOLO_MODEL} YOLO_CONF={YOLO_CONF} DEVICE={dev_str} USE_ROI={USE_ROI} [BUILD {BUILD_ID}]",
+          flush=True)
 
     for si, scene in enumerate(scenes, 1):
         # 天候ラベル集計
