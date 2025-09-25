@@ -1,5 +1,3 @@
-
-
 import os, glob, math, time, traceback
 import numpy as np
 from types import MethodType
@@ -59,8 +57,14 @@ ROI_SIZE_FAR = 80
 ROI_NEAR_M = 20.0
 ROI_FAR_M  = 70.0
 MAX_NUM_ROI = 12
-FULL_SWEEP_EVERY = 10
+FULL_SWEEP_EVERY = 50
 FULL_SWEEP_SHORT_SIDE = 512
+
+# --- ROI fallback settings (when radar produces no ROI) ---
+FALLBACK_GRID_W = 3   # number of tiles horizontally
+FALLBACK_GRID_H = 2   # number of tiles vertically
+FALLBACK_OVERLAP = 0.10  # 10% overlap between tiles to avoid boundary misses
+FALLBACK_MIN_SIDE = 256  # shrink tiles if image very large (optional downscale happens elsewhere)
 
 # ================== DEBUG2 トグル/ヘルパ ==================
 DEBUG2 = True  # Falseにすれば全部黙ります
@@ -353,6 +357,34 @@ def build_rois_from_radar(nusc: NuScenes, sample, cam_token, img_wh):
     return merged
 
 
+# ---------- ROI fallback tile builder ----------
+def build_coarse_fallback_rois(img_wh):
+    """When radar yields no ROI, cover the image with a coarse grid of tiles.
+    Returns a list of boxes {x1,y1,x2,y2,depth} (depth is dummy for sorting compatibility).
+    """
+    w, h = img_wh
+    gw, gh = max(1, FALLBACK_GRID_W), max(1, FALLBACK_GRID_H)
+    # base tile size
+    tw = w / gw
+    th = h / gh
+    # overlap in pixels
+    ox = tw * FALLBACK_OVERLAP
+    oy = th * FALLBACK_OVERLAP
+    rois = []
+    for gy in range(gh):
+        for gx in range(gw):
+            x1 = int(max(0, gx * tw - ox/2))
+            y1 = int(max(0, gy * th - oy/2))
+            x2 = int(min(w, (gx+1) * tw + ox/2))
+            y2 = int(min(h, (gy+1) * th + oy/2))
+            # guard against tiny tiles
+            if (x2 - x1) < 20 or (y2 - y1) < 20:
+                continue
+            rois.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "depth": 9999.0})
+    d2(f"[dbg2/roi-fallback] coarse tiles n={len(rois)} grid={gw}x{gh} overlap={int(FALLBACK_OVERLAP*100)}%")
+    return rois
+
+
 # ---------- 既存GT投影 ----------
 
 def get_gt_2d_box(nusc: NuScenes, ann_token: str, cam_token: str, img_wh):
@@ -418,16 +450,17 @@ def yolo_vehicle_detections_roi(model: YOLO, img_pil, rois):
 
 def yolo_vehicle_detections_any(model: YOLO, img_pil, sample_idx_in_scene, rois):
     """
-    ROIが有効: ROIあり→ROI推論 / ROIなし→全体スイープ
-    ROIを使わない設定: 常に全体
-    全体スイープは FULL_SWEEP_EVERY ごとに必ず走らせる（盲点対策）
+    If ROI is enabled:
+      - If we are on a forced full sweep (every FULL_SWEEP_EVERY), run full-image (downscaled) inference.
+      - Else, if radar-produced ROIs exist, run ROI inference.
+      - Else, build coarse fallback tiles and run ROI-style inference over them (to avoid full-frame).
+    Returns: (detections, used_full: bool, roi_area_px: int)
     """
-    use_full = (not USE_ROI) or (not rois)
+    w, h = img_pil.size
     force_full = (sample_idx_in_scene % FULL_SWEEP_EVERY == 0)
 
-    if use_full or force_full:
-        # 解像度を落として実施（短辺=FULL_SWEEP_SHORT_SIDE）
-        w, h = img_pil.size
+    if not USE_ROI:
+        # Always full
         if min(w, h) > FULL_SWEEP_SHORT_SIDE:
             if w < h:
                 new_w = FULL_SWEEP_SHORT_SIDE
@@ -438,18 +471,40 @@ def yolo_vehicle_detections_any(model: YOLO, img_pil, sample_idx_in_scene, rois)
             img_small = img_pil.resize((new_w, new_h), Image.BILINEAR)
             outs_small = yolo_vehicle_detections_full(model, img_small)
             sx, sy = (w / new_w), (h / new_h)
-            outs = []
-            for b in outs_small:
-                outs.append({
-                    "x1": int(b["x1"] * sx), "y1": int(b["y1"] * sy),
-                    "x2": int(b["x2"] * sx), "y2": int(b["y2"] * sy)
-                })
+            outs = [{"x1": int(b["x1"]*sx), "y1": int(b["y1"]*sy), "x2": int(b["x2"]*sx), "y2": int(b["y2"]*sy)} for b in outs_small]
         else:
             outs = yolo_vehicle_detections_full(model, img_pil)
-        return outs, True  # full=true
-    else:
+        return outs, True, 0
+
+    # ROI is enabled
+    if force_full:
+        # periodic safety sweep to catch drift/misses
+        if min(w, h) > FULL_SWEEP_SHORT_SIDE:
+            if w < h:
+                new_w = FULL_SWEEP_SHORT_SIDE
+                new_h = int(h * (new_w / w))
+            else:
+                new_h = FULL_SWEEP_SHORT_SIDE
+                new_w = int(w * (new_h / h))
+            img_small = img_pil.resize((new_w, new_h), Image.BILINEAR)
+            outs_small = yolo_vehicle_detections_full(model, img_small)
+            sx, sy = (w / new_w), (h / new_h)
+            outs = [{"x1": int(b["x1"]*sx), "y1": int(b["y1"]*sy), "x2": int(b["x2"]*sx), "y2": int(b["y2"]*sy)} for b in outs_small]
+        else:
+            outs = yolo_vehicle_detections_full(model, img_pil)
+        return outs, True, 0
+
+    # Not forced full; prefer ROIs if available
+    if rois:
         outs = yolo_vehicle_detections_roi(model, img_pil, rois)
-        return outs, False  # full=false
+        roi_px = sum(max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"]) for r in rois)
+        return outs, False, roi_px
+
+    # Radar produced no ROIs -> use coarse fallback tiles
+    fallback_rois = build_coarse_fallback_rois((w, h))
+    outs = yolo_vehicle_detections_roi(model, img_pil, fallback_rois)
+    roi_px = sum(max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"]) for r in fallback_rois)
+    return outs, False, roi_px
 
 
 # ---------- ★BEV風ゲーティング ----------
@@ -580,7 +635,7 @@ def main():
 
             # ---- YOLO呼び出し（ROI/全体スイープ切替）----
             t0 = time.perf_counter()
-            yolo_boxes, used_full = yolo_vehicle_detections_any(model, img, sample_idx_in_scene, rois)
+            yolo_boxes, used_full, used_roi_px = yolo_vehicle_detections_any(model, img, sample_idx_in_scene, rois)
             dt_ms = (time.perf_counter() - t0) * 1000.0
             total_ms += dt_ms
 
@@ -589,10 +644,7 @@ def main():
                 total_px += (w * h)
             else:
                 total_roi_calls += 1
-                roi_px = 0
-                for r in rois:
-                    roi_px += max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"])
-                total_px += roi_px
+                total_px += int(used_roi_px)
 
             # === DEBUG counters ===
             dbg = {
@@ -606,9 +658,8 @@ def main():
                 'inference_ms': int(dt_ms),
                 'roi_pixel_ratio_%': 0
             }
-            if not used_full and rois:
-                roi_px = sum((r["x2"]-r["x1"]) * (r["y2"]-r["y1"]) for r in rois)
-                dbg['roi_pixel_ratio_%'] = int(roi_px * 100 / (w*h))
+            if not used_full:
+                dbg['roi_pixel_ratio_%'] = int((used_roi_px * 100) / max(1, (w*h)))
 
             # === 先行/同時の集計 ===
             for ann_t in sample['anns']:
