@@ -59,6 +59,8 @@ ROI_FAR_M  = 70.0
 MAX_NUM_ROI = 12
 FULL_SWEEP_EVERY = 50
 FULL_SWEEP_SHORT_SIDE = 512
+# Batch size for batched ROI inference
+ROI_BATCH_SIZE = 16
 
 # --- ROI fallback settings (when radar produces no ROI) ---
 FALLBACK_GRID_W = 3   # number of tiles horizontally
@@ -459,6 +461,54 @@ def yolo_vehicle_detections_roi(model: YOLO, img_pil, rois):
     return all_out
 
 
+# Batched ROI inference: crops multiple ROIs and runs them through YOLO in mini-batches.
+def yolo_vehicle_detections_roi_batched(model: YOLO, img_pil, rois, batch_size: int = ROI_BATCH_SIZE):
+    """
+    Batched ROI inference: crops multiple ROIs and runs them through YOLO in mini-batches.
+    Args:
+        model: Ultralytics YOLO model.
+        img_pil: PIL.Image of the full frame.
+        rois: list of dicts with keys x1,y1,x2,y2.
+        batch_size: number of crops per model forward.
+    Returns:
+        list of boxes in full-image coordinates (dicts with x1,y1,x2,y2).
+    """
+    if not rois:
+        return []
+
+    outs = []
+    # Precompute crops and offsets to keep alignment
+    offsets = [(r["x1"], r["y1"]) for r in rois]
+
+    try:
+        for start in range(0, len(rois), max(1, batch_size)):
+            end = min(len(rois), start + max(1, batch_size))
+            batch_rois = rois[start:end]
+            batch_crops = [img_pil.crop((r["x1"], r["y1"], r["x2"], r["y2"])) for r in batch_rois]
+
+            # Run a single forward pass for this mini-batch
+            results = model(batch_crops, verbose=False, conf=YOLO_CONF)
+
+            # Map detections back to full-image coordinates
+            for j, res in enumerate(results):
+                r = batch_rois[j]
+                x_off, y_off = r["x1"], r["y1"]
+                boxes = res.boxes.xyxy.cpu().numpy()
+                clss = res.boxes.cls.cpu().numpy()
+                for i in range(len(boxes)):
+                    if int(clss[i]) in VEHICLE_CLASS_IDS:
+                        x1, y1, x2, y2 = boxes[i].astype(int)
+                        outs.append({
+                            "x1": int(x1 + x_off), "y1": int(y1 + y_off),
+                            "x2": int(x2 + x_off), "y2": int(y2 + y_off)
+                        })
+        return outs
+    except Exception as e:
+        # Fallback: if anything goes wrong with batched path, use the original per-ROI loop
+        d2(f"[warn] batched ROI inference failed, falling back to per-ROI loop: {e}")
+        return yolo_vehicle_detections_roi(model, img_pil, rois)
+
+
 def yolo_vehicle_detections_any(model: YOLO, img_pil, sample_idx_in_scene, rois):
     """
     If ROI is enabled:
@@ -507,7 +557,7 @@ def yolo_vehicle_detections_any(model: YOLO, img_pil, sample_idx_in_scene, rois)
 
     # Not forced full; prefer ROIs if available
     if rois:
-        outs = yolo_vehicle_detections_roi(model, img_pil, rois)
+        outs = yolo_vehicle_detections_roi_batched(model, img_pil, rois, ROI_BATCH_SIZE)
         roi_px = sum(max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"]) for r in rois)
         return outs, False, roi_px
 
