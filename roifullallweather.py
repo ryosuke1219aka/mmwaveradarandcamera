@@ -49,16 +49,36 @@ MAX_SCENES = None
 
 # ===== ROI 関連設定 =====
 USE_ROI = True
-ROI_GRID = 48
-ROI_MIN_PTS = 2
+# 少し細かいグリッドにし、最小点数もしきいを下げて「ROIを出しやすく」する
+ROI_GRID = 40
+ROI_MIN_PTS = 1
 ROI_PAD_RATIO = 0.25
 ROI_SIZE_NEAR = 220
 ROI_SIZE_FAR = 80
 ROI_NEAR_M = 20.0
 ROI_FAR_M  = 70.0
-MAX_NUM_ROI = 12
-FULL_SWEEP_EVERY = 50
+
+# ROI数の上限もやや緩める
+MAX_NUM_ROI = 20
+
+# --- ROI総量 “予算”（フレームの画素の何割までROIで使うか）---
+# 例: 0.30 なら画像総画素の30%を上限にROIを採用
+ROI_AREA_BUDGET_RATIO = 0.30   # 0.0～1.0 の範囲で調整
+# 予算超過時の優先度: 近距離(小depth)優先 → 面積の小さいROI優先
+# ※より高度なスコアリング（点密度/速度/rcsなど）は後段で拡張可
+
+# === フルスイープの方針を選べるようにする ===
+#   'none'     : 一切フルスイープしない（ROI/フォールバックのみ）
+#   'periodic' : FULL_SWEEP_EVERY ごとに実施（従来）
+#   'adaptive' : ROIが出ないフレームが続いた時にだけ実施（推奨）
+FULL_SWEEP_POLICY = "adaptive"
+FULL_SWEEP_EVERY = 200           # 'periodic' 用（頻度をさらに下げる）
 FULL_SWEEP_SHORT_SIDE = 512
+
+# adaptive policy 用パラメータ
+ADAPTIVE_FULL_MISS_THRESH = 5    # 連続してROIがゼロのフレーム数で実施
+ADAPTIVE_FULL_MIN_GAP = 50       # 最低でもこれだけフレームはフルを空ける
+
 # Batch size for batched ROI inference
 ROI_BATCH_SIZE = 16
 
@@ -67,6 +87,12 @@ FALLBACK_GRID_W = 3   # number of tiles horizontally
 FALLBACK_GRID_H = 2   # number of tiles vertically
 FALLBACK_OVERLAP = 0.10  # 10% overlap between tiles to avoid boundary misses
 FALLBACK_MIN_SIDE = 256  # shrink tiles if image very large (optional downscale happens elsewhere)
+
+# ---- scene-level sweep state (for adaptive full-sweep policy) ----
+class SceneSweepState:
+    def __init__(self):
+        self.frames_since_full = 0
+        self.consecutive_roi_zero = 0
 
 # ================== DEBUG2 トグル/ヘルパ ==================
 DEBUG2 = True  # Falseにすれば全部黙ります
@@ -339,7 +365,7 @@ def build_rois_from_radar(nusc: NuScenes, sample, cam_token, img_wh):
         x2 = min(w-1, x2 + padw); y2 = min(h-1, y2 + padh)
         if (x2 - x1) < 20 or (y2 - y1) < 20:
             continue
-        rois.append({"x1":x1, "y1":y1, "x2":x2, "y2":y2, "depth": d_med})
+        rois.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "depth": d_med})
 
     if not rois:
         d2(f"[dbg2/b3] ROIs raw={rois_raw} -> kept=0 (minsize/minpts/filters)")
@@ -366,17 +392,49 @@ def build_rois_from_radar(nusc: NuScenes, sample, cam_token, img_wh):
             merged.append(r)
         if len(merged) >= MAX_NUM_ROI:
             break
+
+    # --- ROI面積“予算”の適用 ---
+    # 画像総画素に対して ROI の合計面積が上限(ROI_AREA_BUDGET_RATIO)を超えないように抑制
+    if ROI_AREA_BUDGET_RATIO is not None and ROI_AREA_BUDGET_RATIO > 0.0:
+        budget_px = int(ROI_AREA_BUDGET_RATIO * w * h)
+        # 近距離(小depth)優先、次に面積の小さい順で並べ替え
+        merged.sort(key=lambda r: (r["depth"], (r["x2"]-r["x1"]) * (r["y2"]-r["y1"])))
+        kept = []
+        area_sum = 0
+        for r in merged:
+            a = max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"])
+            # 少なくとも1枚は必ず採用（予算が極端に小さい設定への対策）
+            if (area_sum + a) <= budget_px or len(kept) == 0:
+                kept.append(r)
+                area_sum += a
+            # 予算超過したら打ち切り
+            if area_sum >= budget_px:
+                break
+        # 上限枚数も適用（念のため）
+        if len(kept) > MAX_NUM_ROI:
+            kept = kept[:MAX_NUM_ROI]
+        # デバッグ出力
+        d2(f"[dbg2/b4-budget] ROI budget applied: kept={len(kept)} area%={int(area_sum*100/max(1,w*h))}% (budget={int(ROI_AREA_BUDGET_RATIO*100)}%)")
+        merged = kept
+
+    # ROIが極端に少ない場合は、粗いグリッドで少し補う（フル回避のため）
+    if len(merged) < 2:
+        extra = build_coarse_fallback_rois(img_wh)
+        # 近距離優先で先頭数個だけ追加
+        for e in extra[:max(0, 4 - len(merged))]:
+            merged.append(e)
     d2(f"[dbg2/b4] ROIs raw={rois_raw} merged={len(merged)} (MAX={MAX_NUM_ROI})")
     return merged
 
 
 # ---------- ROI fallback tile builder ----------
-def build_coarse_fallback_rois(img_wh):
+def build_coarse_fallback_rois(img_wh, grid_scale: float = 1.0):
     """When radar yields no ROI, cover the image with a coarse grid of tiles.
     Returns a list of boxes {x1,y1,x2,y2,depth} (depth is dummy for sorting compatibility).
     """
     w, h = img_wh
-    gw, gh = max(1, FALLBACK_GRID_W), max(1, FALLBACK_GRID_H)
+    gw = max(1, int(round(FALLBACK_GRID_W * grid_scale)))
+    gh = max(1, int(round(FALLBACK_GRID_H * grid_scale)))
     # base tile size
     tw = w / gw
     th = h / gh
@@ -477,8 +535,6 @@ def yolo_vehicle_detections_roi_batched(model: YOLO, img_pil, rois, batch_size: 
         return []
 
     outs = []
-    # Precompute crops and offsets to keep alignment
-    offsets = [(r["x1"], r["y1"]) for r in rois]
 
     try:
         for start in range(0, len(rois), max(1, batch_size)):
@@ -509,62 +565,74 @@ def yolo_vehicle_detections_roi_batched(model: YOLO, img_pil, rois, batch_size: 
         return yolo_vehicle_detections_roi(model, img_pil, rois)
 
 
-def yolo_vehicle_detections_any(model: YOLO, img_pil, sample_idx_in_scene, rois):
+def yolo_vehicle_detections_any(model: YOLO, img_pil, sample_idx_in_scene, rois, state: "SceneSweepState"):
     """
-    If ROI is enabled:
-      - If we are on a forced full sweep (every FULL_SWEEP_EVERY), run full-image (downscaled) inference.
-      - Else, if radar-produced ROIs exist, run ROI inference.
-      - Else, build coarse fallback tiles and run ROI-style inference over them (to avoid full-frame).
+    Policy order:
+      1) ROIがあれば ROI 推論
+      2) ROIが無ければ coarse fallback（グリッド）で ROI 風推論
+      3) FULL_SWEEP_POLICY に応じてフルスイープ（none: しない / periodic / adaptive）
     Returns: (detections, used_full: bool, roi_area_px: int)
     """
     w, h = img_pil.size
-    force_full = (sample_idx_in_scene % FULL_SWEEP_EVERY == 0)
+
+    # Helper: run full-image inference (downscaled if needed)
+    def _run_full():
+        if min(w, h) > FULL_SWEEP_SHORT_SIDE:
+            if w < h:
+                new_w = FULL_SWEEP_SHORT_SIDE
+                new_h = int(h * (new_w / w))
+            else:
+                new_h = FULL_SWEEP_SHORT_SIDE
+                new_w = int(w * (new_h / h))
+            img_small = img_pil.resize((new_w, new_h), Image.BILINEAR)
+            outs_small = yolo_vehicle_detections_full(model, img_small)
+            sx, sy = (w / new_w), (h / new_h)
+            outs = [{"x1": int(b["x1"]*sx), "y1": int(b["y1"]*sy), "x2": int(b["x2"]*sx), "y2": int(b["y2"]*sy)} for b in outs_small]
+        else:
+            outs = yolo_vehicle_detections_full(model, img_pil)
+        return outs
 
     if not USE_ROI:
-        # Always full
-        if min(w, h) > FULL_SWEEP_SHORT_SIDE:
-            if w < h:
-                new_w = FULL_SWEEP_SHORT_SIDE
-                new_h = int(h * (new_w / w))
-            else:
-                new_h = FULL_SWEEP_SHORT_SIDE
-                new_w = int(w * (new_h / h))
-            img_small = img_pil.resize((new_w, new_h), Image.BILINEAR)
-            outs_small = yolo_vehicle_detections_full(model, img_small)
-            sx, sy = (w / new_w), (h / new_h)
-            outs = [{"x1": int(b["x1"]*sx), "y1": int(b["y1"]*sy), "x2": int(b["x2"]*sx), "y2": int(b["y2"]*sy)} for b in outs_small]
-        else:
-            outs = yolo_vehicle_detections_full(model, img_pil)
+        outs = _run_full()
+        state.frames_since_full = 0
         return outs, True, 0
 
-    # ROI is enabled
-    if force_full:
-        # periodic safety sweep to catch drift/misses
-        if min(w, h) > FULL_SWEEP_SHORT_SIDE:
-            if w < h:
-                new_w = FULL_SWEEP_SHORT_SIDE
-                new_h = int(h * (new_w / w))
-            else:
-                new_h = FULL_SWEEP_SHORT_SIDE
-                new_w = int(w * (new_h / h))
-            img_small = img_pil.resize((new_w, new_h), Image.BILINEAR)
-            outs_small = yolo_vehicle_detections_full(model, img_small)
-            sx, sy = (w / new_w), (h / new_h)
-            outs = [{"x1": int(b["x1"]*sx), "y1": int(b["y1"]*sy), "x2": int(b["x2"]*sx), "y2": int(b["y2"]*sy)} for b in outs_small]
-        else:
-            outs = yolo_vehicle_detections_full(model, img_pil)
-        return outs, True, 0
-
-    # Not forced full; prefer ROIs if available
+    # 1) Prefer radar ROIs
     if rois:
         outs = yolo_vehicle_detections_roi_batched(model, img_pil, rois, ROI_BATCH_SIZE)
         roi_px = sum(max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"]) for r in rois)
+        state.frames_since_full += 1
+        state.consecutive_roi_zero = 0
         return outs, False, roi_px
 
-    # Radar produced no ROIs -> use coarse fallback tiles
-    fallback_rois = build_coarse_fallback_rois((w, h))
-    outs = yolo_vehicle_detections_roi(model, img_pil, fallback_rois)
+    # 2) No radar ROI -> build fallback tiles (slightly denser if long time since full)
+    grid_scale = 1.0 if state.frames_since_full < ADAPTIVE_FULL_MIN_GAP else 1.5
+    fallback_rois = build_coarse_fallback_rois((w, h), grid_scale=grid_scale)
+    outs = yolo_vehicle_detections_roi_batched(model, img_pil, fallback_rois, ROI_BATCH_SIZE)
     roi_px = sum(max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"]) for r in fallback_rois)
+
+    # ヒットが無ければ「ROIゼロ」扱いでカウンタを進める
+    state.frames_since_full += 1
+    state.consecutive_roi_zero += 1
+
+    # 3) Check policy for full sweep
+    do_full = False
+    if FULL_SWEEP_POLICY == "none":
+        do_full = False
+    elif FULL_SWEEP_POLICY == "periodic":
+        do_full = (sample_idx_in_scene % max(1, FULL_SWEEP_EVERY) == 0)
+    elif FULL_SWEEP_POLICY == "adaptive":
+        do_full = (state.frames_since_full >= ADAPTIVE_FULL_MIN_GAP and
+                   state.consecutive_roi_zero >= ADAPTIVE_FULL_MISS_THRESH)
+    else:
+        do_full = False
+
+    if do_full:
+        outs_full = _run_full()
+        state.frames_since_full = 0
+        state.consecutive_roi_zero = 0
+        return outs_full, True, 0
+
     return outs, False, roi_px
 
 
@@ -682,6 +750,7 @@ def main():
         vehicle_hist = {}  # instance_token -> {'first_radar_ts':None,'first_camera_ts':None}
         start_scene = time.time()
         sample_idx_in_scene = 0
+        sweep_state = SceneSweepState()
 
         while token:
             sample = nusc.get("sample", token)
@@ -710,13 +779,16 @@ def main():
 
             # ---- YOLO呼び出し（ROI/全体スイープ切替）----
             t0 = time.perf_counter()
-            yolo_boxes, used_full, used_roi_px = yolo_vehicle_detections_any(model, img, sample_idx_in_scene, rois)
+            yolo_boxes, used_full, used_roi_px = yolo_vehicle_detections_any(model, img, sample_idx_in_scene, rois, sweep_state)
             dt_ms = (time.perf_counter() - t0) * 1000.0
             total_ms += dt_ms
 
             if used_full:
                 total_full_calls += 1
                 total_px += (w * h)
+                # safety: already handled inside yolo_vehicle_detections_any, but keep consistent
+                # sweep_state.frames_since_full = 0
+                # sweep_state.consecutive_roi_zero = 0
             else:
                 total_roi_calls += 1
                 total_px += int(used_roi_px)
