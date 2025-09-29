@@ -62,8 +62,8 @@ ROI_FAR_M  = 70.0
 MAX_NUM_ROI = 20
 
 # --- ROI総量 “予算”（フレームの画素の何割までROIで使うか）---
-# 例: 0.30 なら画像総画素の30%を上限にROIを採用
-ROI_AREA_BUDGET_RATIO = 0.30   # 0.0～1.0 の範囲で調整
+# 例: 0.15 なら画像総画素の15%を上限にROIを採用
+ROI_AREA_BUDGET_RATIO = 0.15   # 0.0～1.0 の範囲で調整
 # 予算超過時の優先度: 近距離(小depth)優先 → 面積の小さいROI優先
 # ※より高度なスコアリング（点密度/速度/rcsなど）は後段で拡張可
 
@@ -156,6 +156,8 @@ def _parse_args():
                    help="YOLO confidence threshold (default from YOLO_CONF).")
     p.add_argument("--device", default=None,
                    help="Torch device for YOLO (e.g., 'cuda:0', 'mps', 'cpu'). If omitted, Ultralytics default is used.")
+    p.add_argument("--roi-budget", type=float, default=float(os.environ.get("ROI_BUDGET", ROI_AREA_BUDGET_RATIO)),
+                   help="ROI area budget ratio (0.0-1.0). Can also set via env ROI_BUDGET.")
     return p.parse_args()
 
 
@@ -695,9 +697,11 @@ def filter_scenes(nusc: NuScenes):
 def main():
     # parse CLI options and override defaults
     args = _parse_args()
-    global YOLO_MODEL, YOLO_CONF
+    global YOLO_MODEL, YOLO_CONF, ROI_AREA_BUDGET_RATIO
     YOLO_MODEL = args.yolo_model
     YOLO_CONF = args.conf
+    if args.roi_budget is not None:
+        ROI_AREA_BUDGET_RATIO = max(0.0, min(1.0, args.roi_budget))
 
     print("[1/7] Load NuScenes...")
     nusc = NuScenes(version=NUSC_VERSION, dataroot=PRIMARY_DATAROOT, verbose=True)
@@ -737,8 +741,7 @@ def main():
 
     print("[5/7] Iterate samples & measure timing...")
     dev_str = getattr(args, "device", None) or "auto"
-    print(f"  CONFIG: IOU_THRESH={IOU_THRESH} NSWEEPS={NSWEEPS} RADAR_MIN_PTS={RADAR_MIN_PTS} "
-          f"YOLO_MODEL={YOLO_MODEL} YOLO_CONF={YOLO_CONF} DEVICE={dev_str} USE_ROI={USE_ROI} [BUILD {BUILD_ID}]",
+    print(f"  CONFIG: IOU_THRESH={IOU_THRESH} NSWEEPS={NSWEEPS} RADAR_MIN_PTS={RADAR_MIN_PTS} YOLO_MODEL={YOLO_MODEL} YOLO_CONF={YOLO_CONF} DEVICE={dev_str} USE_ROI={USE_ROI} ROI_BUDGET={int(ROI_AREA_BUDGET_RATIO*100)}% [BUILD {BUILD_ID}]", 
           flush=True)
 
     for si, scene in enumerate(scenes, 1):
