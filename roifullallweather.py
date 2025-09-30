@@ -83,9 +83,9 @@ ADAPTIVE_FULL_MIN_GAP = 50       # 最低でもこれだけフレームはフル
 ROI_BATCH_SIZE = 16
 
 # --- ROI fallback settings (when radar produces no ROI) ---
-FALLBACK_GRID_W = 3   # number of tiles horizontally
-FALLBACK_GRID_H = 2   # number of tiles vertically
-FALLBACK_OVERLAP = 0.10  # 10% overlap between tiles to avoid boundary misses
+FALLBACK_GRID_W = 2   # number of tiles horizontally (reduced)
+FALLBACK_GRID_H = 1   # number of tiles vertically   (reduced)
+FALLBACK_OVERLAP = 0.0  # 0% overlap to minimize duplicate coverage
 FALLBACK_MIN_SIDE = 256  # shrink tiles if image very large (optional downscale happens elsewhere)
 
 # ---- scene-level sweep state (for adaptive full-sweep policy) ----
@@ -458,6 +458,30 @@ def build_coarse_fallback_rois(img_wh, grid_scale: float = 1.0):
     return rois
 
 
+# --- Helper: Apply ROI area budget to fallback tiles ---
+def _apply_roi_budget(rois, w, h, budget_ratio, max_num=MAX_NUM_ROI):
+    """
+    Apply an area budget to a list of ROI boxes so that the total covered pixel area
+    does not exceed budget_ratio * (w*h). Selection priority: smaller depth first
+    (closer objects), then smaller area. Ensures at least one ROI is kept if list non-empty.
+    """
+    if not rois or budget_ratio is None or budget_ratio <= 0.0:
+        return rois
+    budget_px = int(budget_ratio * w * h)
+    # sort by (depth asc, area asc)
+    rois_sorted = sorted(rois, key=lambda r: (r.get("depth", 9999.0),
+                                              (r["x2"]-r["x1"]) * (r["y2"]-r["y1"])))
+    kept, area_sum = [], 0
+    for r in rois_sorted:
+        a = max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"])
+        if (area_sum + a) <= budget_px or len(kept) == 0:
+            kept.append(r)
+            area_sum += a
+        if area_sum >= budget_px or len(kept) >= max_num:
+            break
+    return kept
+
+
 # ---------- 既存GT投影 ----------
 
 def get_gt_2d_box(nusc: NuScenes, ann_token: str, cam_token: str, img_wh):
@@ -610,6 +634,8 @@ def yolo_vehicle_detections_any(model: YOLO, img_pil, sample_idx_in_scene, rois,
     # 2) No radar ROI -> build fallback tiles (slightly denser if long time since full)
     grid_scale = 1.0 if state.frames_since_full < ADAPTIVE_FULL_MIN_GAP else 1.5
     fallback_rois = build_coarse_fallback_rois((w, h), grid_scale=grid_scale)
+    # Apply ROI area budget to fallback tiles to avoid near-full-image coverage
+    fallback_rois = _apply_roi_budget(fallback_rois, w, h, ROI_AREA_BUDGET_RATIO, MAX_NUM_ROI)
     outs = yolo_vehicle_detections_roi_batched(model, img_pil, fallback_rois, ROI_BATCH_SIZE)
     roi_px = sum(max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"]) for r in fallback_rois)
 
