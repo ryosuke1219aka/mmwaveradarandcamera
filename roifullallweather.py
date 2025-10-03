@@ -147,6 +147,96 @@ def _center(box):
 def _contains(box, x, y):
     return (box["x1"] <= x <= box["x2"]) and (box["y1"] <= y <= box["y2"])
 
+# ===== Confusion (tile-based) evaluation =====
+TILE_W = 8   # 横タイル数（必要に応じて調整）
+TILE_H = 4   # 縦タイル数
+IOU_EVAL_THR = 0.50  # IoU閾値（評価用）
+
+def _tiles_for_image(img_wh, gw=TILE_W, gh=TILE_H):
+    w, h = img_wh
+    tw, th = w / gw, h / gh
+    tiles = []
+    for j in range(gh):
+        for i in range(gw):
+            x1 = int(round(i * tw))
+            y1 = int(round(j * th))
+            x2 = int(round((i+1) * tw))
+            y2 = int(round((j+1) * th))
+            tiles.append({"x1":x1,"y1":y1,"x2":x2,"y2":y2})
+    return tiles, tw, th
+
+def _center_of(box):
+    # 既存の _center を使う薄いラッパ（将来の互換性のため）
+    return _center(box)
+
+def _tile_index_for_point(x, y, w, h, gw=TILE_W, gh=TILE_H):
+    ix = min(gw-1, max(0, int((x / max(1e-6,w)) * gw)))
+    iy = min(gh-1, max(0, int((y / max(1e-6,h)) * gh)))
+    return iy*gw + ix
+
+def _greedy_match_iou(gts, dets, thr=IOU_EVAL_THR):
+    """
+    GTと検出の1対1マッチング（IoU降順で貪欲選択）。
+    戻り値: (matched_gt_idx_set, matched_det_idx_set)
+    """
+    used_det = set(); used_gt = set()
+    pairs = []
+    for gi, g in enumerate(gts):
+        for di, d in enumerate(dets):
+            iou = calculate_iou(g, d)
+            if iou >= thr:
+                pairs.append((iou, gi, di))
+    for iou, gi, di in sorted(pairs, key=lambda x: -x[0]):
+        if gi in used_gt or di in used_det:
+            continue
+        used_gt.add(gi); used_det.add(di)
+    return used_gt, used_det
+
+def confusion_tiles(gt_boxes, det_boxes, img_wh, gw=TILE_W, gh=TILE_H, thr=IOU_EVAL_THR):
+    """
+    タイル単位の TP/TN/FP/FN を算出。
+      - 正タイル: GT中心が1つ以上
+      - 負タイル: 正タイル以外
+      - 検出は中心点の属するタイルで評価
+      - 正タイルで IoU>=thr の“マッチ済み検出”が1つ以上→TPタイル、なければFNタイル
+      - 負タイルで検出>=1→FPタイル、0→TNタイル
+    """
+    w, h = img_wh
+    tiles, tw, th = _tiles_for_image(img_wh, gw, gh)
+
+    # 正/負タイルラベリング（GT中心）
+    pos_tile = [False] * (gw*gh)
+    for g in gt_boxes:
+        cx, cy = _center_of(g)
+        tidx = _tile_index_for_point(cx, cy, w, h, gw, gh)
+        pos_tile[tidx] = True
+
+    # 各タイルに属する検出のインデックス
+    det_in_tile = [[] for _ in range(gw*gh)]
+    for di, d in enumerate(det_boxes):
+        cx, cy = _center_of(d)
+        tidx = _tile_index_for_point(cx, cy, w, h, gw, gh)
+        det_in_tile[tidx].append(di)
+
+    # IoUマッチ（画像全体で1対1）
+    matched_gt, matched_det = _greedy_match_iou(gt_boxes, det_boxes, thr)
+
+    TP=TN=FP=FN=0
+    for t in range(gw*gh):
+        det_idxs = det_in_tile[t]
+        if pos_tile[t]:
+            has_tp = any(di in matched_det for di in det_idxs)
+            if has_tp:
+                TP += 1
+            else:
+                FN += 1
+        else:
+            if len(det_idxs) > 0:
+                FP += 1
+            else:
+                TN += 1
+    return TP, TN, FP, FN
+
 # === CLI arguments ===
 def _parse_args():
     p = argparse.ArgumentParser(description="Radar-guided ROI vehicle detection (NuScenes)")
@@ -756,6 +846,12 @@ def main():
     simultaneous = 0
     radar_leads = []
 
+    # タイルベース混同行列の累積
+    sum_tp = 0
+    sum_tn = 0
+    sum_fp = 0
+    sum_fn = 0
+
     # 速度/負荷観測
     total_ms = 0.0
     total_px = 0         # 処理した総ピクセル数（ROIなら合計面積）
@@ -806,6 +902,9 @@ def main():
                     d2(f"[dbg2/b5] scene={scene['name']} sample_idx={sample_idx_in_scene} "
                        f"ROI_n={len(rois)} ROI_px%={int(px*100/(w*h)) if (w*h)>0 else 0}")
 
+            # === このフレームのGT 2Dボックス蓄積（タイル評価用） ===
+            gt2d_list = []
+
             # ---- YOLO呼び出し（ROI/全体スイープ切替）----
             t0 = time.perf_counter()
             yolo_boxes, used_full, used_roi_px = yolo_vehicle_detections_any(model, img, sample_idx_in_scene, rois, sweep_state)
@@ -854,6 +953,9 @@ def main():
                 if rec['first_camera_ts'] is None:
                     gt2d = get_gt_2d_box(nusc, ann_t, cam_t, (w, h))
                     if gt2d is not None:
+                        # タイル評価用に保持
+                        gt2d_list.append(gt2d)
+                        # 先行/同時の集計用ヒット判定
                         for det in yolo_boxes:
                             iou = calculate_iou(gt2d, det)
                             hit = (iou >= IOU_THRESH) or _contains(gt2d, *_center(det))
@@ -861,6 +963,17 @@ def main():
                                 dbg['iou_hit'] += 1
                                 rec['first_camera_ts'] = ts
                                 break
+                    else:
+                        # GTが2Dに投影できない場合はスキップ
+                        pass
+
+            # === タイルベース混同行列をフレーム単位で加算 ===
+            if gt2d_list is not None:
+                tp_t, tn_t, fp_t, fn_t = confusion_tiles(gt2d_list, yolo_boxes, (w, h))
+                sum_tp += tp_t
+                sum_tn += tn_t
+                sum_fp += fp_t
+                sum_fn += fn_t
 
             if sample_idx_in_scene < 3:
                 mode = "FULL" if used_full else f"ROI(n={len(rois)}, {dbg['roi_pixel_ratio_%']}%)"
@@ -900,6 +1013,20 @@ def main():
             print(f"  radar lead avg={np.mean(radar_leads):.3f}s max={np.max(radar_leads):.3f}s")
     else:
         print("  No matched pairs (check thresholds / data availability).")
+
+    # ===== [8/8] Tile-based Confusion Matrix =====
+    total_tiles = sum_tp + sum_tn + sum_fp + sum_fn
+    if total_tiles > 0:
+        acc = (sum_tp + sum_tn) / total_tiles
+        recall = sum_tp / max(1, (sum_tp + sum_fn))       # = TPR
+        specificity = sum_tn / max(1, (sum_tn + sum_fp))  # = TNR
+        precision = sum_tp / max(1, (sum_tp + sum_fp))
+        f1 = 2 * precision * recall / max(1e-12, (precision + recall))
+        print("\n[8/8] Tile-based Confusion (IoU>=%.2f, grid=%dx%d)" % (IOU_EVAL_THR, TILE_W, TILE_H))
+        print(f"  TP={sum_tp}  TN={sum_tn}  FP={sum_fp}  FN={sum_fn}  (tiles total={total_tiles})")
+        print(f"  Acc={acc:.3f}  Precision={precision:.3f}  Recall={recall:.3f}  Specificity={specificity:.3f}  F1={f1:.3f}")
+    else:
+        print("\n[8/8] Tile-based Confusion: no tiles counted (check TILE_W/H settings).")
 
     # 参考：天候別内訳
     if weather_scene_counts:
