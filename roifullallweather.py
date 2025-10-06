@@ -237,6 +237,78 @@ def confusion_tiles(gt_boxes, det_boxes, img_wh, gw=TILE_W, gh=TILE_H, thr=IOU_E
                 TN += 1
     return TP, TN, FP, FN
 
+# ===== Box-level evaluation (IoU matching) + PR/AP =====
+
+def _match_dets_to_gts_by_iou(gt_boxes, det_boxes, iou_thr=0.5):
+    if not gt_boxes or not det_boxes:
+        return set(), set(), []
+    pairs = []
+    for gi, g in enumerate(gt_boxes):
+        for di, d in enumerate(det_boxes):
+            iou = calculate_iou(g, d)
+            if iou >= iou_thr:
+                pairs.append((iou, gi, di))
+    pairs.sort(key=lambda x: -x[0])
+    used_gt, used_det = set(), set()
+    chosen = []
+    for iou, gi, di in pairs:
+        if gi in used_gt or di in used_det:
+            continue
+        used_gt.add(gi); used_det.add(di)
+        chosen.append((gi, di, iou))
+    return used_gt, used_det, chosen
+
+def box_eval_counts(gt_boxes, det_boxes, iou_thr=0.5):
+    if gt_boxes is None: gt_boxes = []
+    if det_boxes is None: det_boxes = []
+    matched_gt, matched_det, _ = _match_dets_to_gts_by_iou(gt_boxes, det_boxes, iou_thr)
+    TP = len(matched_gt)
+    FP = max(0, len(det_boxes) - len(matched_det))
+    FN = max(0, len(gt_boxes) - len(matched_gt))
+    return TP, FP, FN
+
+def pr_accumulate_frame(gt_boxes, det_boxes_with_conf, iou_thr, scores_list, is_tp_list, total_gt_counter):
+    total_gt_counter[0] += len(gt_boxes or [])
+    if not det_boxes_with_conf:
+        return
+    dets = sorted(det_boxes_with_conf, key=lambda d: -float(d.get("conf", 0.0)))
+    matched_gt = set()
+    for d in dets:
+        best_iou = 0.0; best_g = -1
+        for gi, g in enumerate(gt_boxes or []):
+            if gi in matched_gt: 
+                continue
+            iou = calculate_iou(g, d)
+            if iou > best_iou:
+                best_iou = iou; best_g = gi
+        is_tp = (best_g >= 0 and best_iou >= iou_thr)
+        if is_tp:
+            matched_gt.add(best_g)
+        scores_list.append(float(d.get("conf", 0.0)))
+        is_tp_list.append(1 if is_tp else 0)
+
+def _compute_ap(scores, is_tp, total_gt, pr_points=101):
+    if total_gt <= 0 or len(scores) == 0:
+        return [], [], 0.0
+    order = np.argsort(-np.asarray(scores))
+    tp = np.asarray(is_tp)[order].astype(np.int32)
+    fp = 1 - tp
+    cum_tp = np.cumsum(tp); cum_fp = np.cumsum(fp)
+    recalls = cum_tp / float(total_gt)
+    precisions = cum_tp / np.maximum(1, (cum_tp + cum_fp))
+    mrec = np.concatenate(([0.0], recalls, [1.0]))
+    mpre = np.concatenate(([0.0], precisions, [0.0]))
+    for i in range(mpre.size - 1, 0, -1):
+        mpre[i-1] = max(mpre[i-1], mpre[i])
+    recall_points = np.linspace(0, 1, pr_points)
+    prec_at_rec = []
+    for r in recall_points:
+        inds = np.where(mrec >= r)[0]
+        p = 0.0 if len(inds) == 0 else np.max(mpre[inds])
+        prec_at_rec.append(p)
+    ap = float(np.mean(prec_at_rec))
+    return recalls.tolist(), precisions.tolist(), ap
+
 # === CLI arguments ===
 def _parse_args():
     p = argparse.ArgumentParser(description="Radar-guided ROI vehicle detection (NuScenes)")
@@ -248,6 +320,12 @@ def _parse_args():
                    help="Torch device for YOLO (e.g., 'cuda:0', 'mps', 'cpu'). If omitted, Ultralytics default is used.")
     p.add_argument("--roi-budget", type=float, default=float(os.environ.get("ROI_BUDGET", ROI_AREA_BUDGET_RATIO)),
                    help="ROI area budget ratio (0.0-1.0). Can also set via env ROI_BUDGET.")
+    p.add_argument("--eval-iou", type=float, default=0.50,
+                    help="IoU threshold for box-level evaluation (TP/FP/FN). Default=0.50.")
+    p.add_argument("--eval-map", action="store_true",
+                    help="Compute dataset-level PR curve and AP/mAP using detection confidences.")
+    p.add_argument("--pr-curve-points", type=int, default=101,
+                    help="Number of recall points for PR/AUC (101 for COCO-style).")
     return p.parse_args()
 
 
@@ -614,7 +692,12 @@ def yolo_vehicle_detections_full(model: YOLO, img_pil):
     for i in range(len(boxes)):
         if int(clss[i]) in VEHICLE_CLASS_IDS:
             x1,y1,x2,y2 = boxes[i].astype(int)
-            outs.append({"x1":int(x1),"y1":int(y1),"x2":int(x2),"y2":int(y2)})
+            conf = float(res.boxes.conf.cpu().numpy()[i])
+            outs.append({
+                "x1": int(x1), "y1": int(y1),
+                "x2": int(x2), "y2": int(y2),
+                "conf": conf
+            })
     return outs
 
 
@@ -628,9 +711,11 @@ def yolo_vehicle_detections_roi(model: YOLO, img_pil, rois):
         for i in range(len(boxes)):
             if int(clss[i]) in VEHICLE_CLASS_IDS:
                 x1,y1,x2,y2 = boxes[i].astype(int)
+                conf = float(res.boxes.conf.cpu().numpy()[i])
                 all_out.append({
                     "x1": int(x1 + r["x1"]), "y1": int(y1 + r["y1"]),
-                    "x2": int(x2 + r["x1"]), "y2": int(y2 + r["y1"]) 
+                    "x2": int(x2 + r["x1"]), "y2": int(y2 + r["y1"]),
+                    "conf": conf
                 })
     return all_out
 
@@ -670,9 +755,11 @@ def yolo_vehicle_detections_roi_batched(model: YOLO, img_pil, rois, batch_size: 
                 for i in range(len(boxes)):
                     if int(clss[i]) in VEHICLE_CLASS_IDS:
                         x1, y1, x2, y2 = boxes[i].astype(int)
+                        conf = float(res.boxes.conf.cpu().numpy()[i])
                         outs.append({
                             "x1": int(x1 + x_off), "y1": int(y1 + y_off),
-                            "x2": int(x2 + x_off), "y2": int(y2 + y_off)
+                            "x2": int(x2 + x_off), "y2": int(y2 + y_off),
+                            "conf": conf
                         })
         return outs
     except Exception as e:
@@ -861,6 +948,17 @@ def main():
     # 天候別シーン数
     weather_scene_counts = {}
 
+    # Box-level cumulative counters
+    sum_box_tp = 0
+    sum_box_fp = 0
+    sum_box_fn = 0
+
+    # Dataset-level PR/AP accumulators
+    pr_scores = []
+    pr_is_tp = []
+    pr_total_gt = [0]  # mutable counter for total GT count
+    iou_eval_thr = float(getattr(args, "eval_iou", 0.50))
+
     print("[5/7] Iterate samples & measure timing...")
     dev_str = getattr(args, "device", None) or "auto"
     print(f"  CONFIG: IOU_THRESH={IOU_THRESH} NSWEEPS={NSWEEPS} RADAR_MIN_PTS={RADAR_MIN_PTS} YOLO_MODEL={YOLO_MODEL} YOLO_CONF={YOLO_CONF} DEVICE={dev_str} USE_ROI={USE_ROI} ROI_BUDGET={int(ROI_AREA_BUDGET_RATIO*100)}% [BUILD {BUILD_ID}]", 
@@ -966,6 +1064,17 @@ def main():
                     else:
                         # GTが2Dに投影できない場合はスキップ
                         pass
+            
+                        # === Box-level evaluation (per frame) ===
+            if gt2d_list is not None:
+                det_boxes_plain = [{"x1":b["x1"],"y1":b["y1"],"x2":b["x2"],"y2":b["y2"]} for b in yolo_boxes]
+                tp_b, fp_b, fn_b = box_eval_counts(gt2d_list, det_boxes_plain, iou_thr=iou_eval_thr)
+                sum_box_tp += tp_b; sum_box_fp += fp_b; sum_box_fn += fn_b
+
+                # PR/AP accumulation if requested (needs confidences)
+                if args.eval_map:
+                    pr_accumulate_frame(gt2d_list, yolo_boxes, iou_eval_thr, pr_scores, pr_is_tp, pr_total_gt)
+
 
             # === タイルベース混同行列をフレーム単位で加算 ===
             if gt2d_list is not None:
@@ -1033,6 +1142,30 @@ def main():
         print("\n[Appendix] Scene counts by weather tag (rough):")
         for k,v in sorted(weather_scene_counts.items(), key=lambda x: (-x[1], x[0])):
             print(f"  {k:>7}: {v}")
+    
+    # ===== [9/9] Box-level (IoU-based) =====
+    total_pos = sum_box_tp + sum_box_fn
+    total_pred = sum_box_tp + sum_box_fp
+    if (total_pos + total_pred) > 0:
+        box_precision = sum_box_tp / max(1, (sum_box_tp + sum_box_fp))
+        box_recall = sum_box_tp / max(1, (sum_box_tp + sum_box_fn))
+        box_f1 = 2 * box_precision * box_recall / max(1e-12, (box_precision + box_recall))
+        print("\n[9/9] Box-level (IoU>=%.2f)" % (iou_eval_thr,))
+        print(f"  TP={sum_box_tp}  FP={sum_box_fp}  FN={sum_box_fn}")
+        print(f"  Precision={box_precision:.3f}  Recall={box_recall:.3f}  F1={box_f1:.3f}")
+    else:
+        print("\n[9/9] Box-level: no boxes counted.")
+
+    # ===== [10/10] Dataset PR/AP (confidence-aware) =====
+    if args.eval_map:
+        recalls, precisions, ap = _compute_ap(pr_scores, pr_is_tp, pr_total_gt[0], pr_points=getattr(args, "pr_curve_points", 101))
+        print("\n[10/10] PR/AP (IoU>=%.2f)" % (iou_eval_thr,))
+        print(f"  total_gt={pr_total_gt[0]}  dets={len(pr_scores)}  AP={ap:.3f}")
+        if len(recalls) > 0 and len(precisions) > 0:
+            for i in np.linspace(0, len(recalls)-1, num=5, dtype=int):
+                print(f"   r={recalls[i]:.2f}  p={precisions[i]:.2f}")
+        else:
+            print("  (no detections or no GT; cannot compute PR)")
 
 
 if __name__ == "__main__":
