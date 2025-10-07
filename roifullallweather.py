@@ -898,6 +898,55 @@ def filter_scenes(nusc: NuScenes):
             break
     return selected
 
+### 追加: シンプルな追跡用クラス ###
+class SimpleTracker:
+    def __init__(self, iou_threshold=0.3, max_age=5):
+        self.tracks = []
+        self.next_id = 0
+        self.iou_threshold = iou_threshold
+        self.max_age = max_age
+
+    def update(self, detections):
+        # 既存トラックと新規検出のマッチング
+        matches = []
+        used_det_indices = set()
+        for i, track in enumerate(self.tracks):
+            best_iou = 0
+            best_det_idx = -1
+            for j, det in enumerate(detections):
+                if j in used_det_indices:
+                    continue
+                # calculate_iouはグローバルに定義されている関数を使用
+                iou = calculate_iou(track['box'], det)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_det_idx = j
+            
+            if best_iou > self.iou_threshold:
+                matches.append((i, best_det_idx))
+                used_det_indices.add(best_det_idx)
+
+        # マッチしたトラックを更新
+        matched_track_indices = {m[0] for m in matches}
+        for track_idx, det_idx in matches:
+            self.tracks[track_idx]['box'] = detections[det_idx]
+            self.tracks[track_idx]['age'] = 0
+
+        # マッチしなかったトラックの年齢を増やす
+        for i, track in enumerate(self.tracks):
+            if i not in matched_track_indices:
+                track['age'] += 1
+
+        # 古くなったトラックを削除
+        self.tracks = [t for t in self.tracks if t['age'] < self.max_age]
+
+        # マッチしなかった検出から新しいトラックを作成
+        for i, det in enumerate(detections):
+            if i not in used_det_indices:
+                self.tracks.append({'id': self.next_id, 'box': det, 'age': 0})
+                self.next_id += 1
+        
+        return self.tracks
 
 # ================== メイン ==================
 
@@ -1005,31 +1054,47 @@ def main():
             except Exception:
                 token = sample["next"]; continue
 
-            # ROI生成の時間を計測
-            rois = []
+            ### 変更: トラッキングを組み込んだROI生成とYOLO実行 ###
+
+            # --- 1. 追跡情報から「予測ROI」を生成 ---
+            predicted_rois = []
+            for track in tracker.tracks:
+                box = track['box']
+                # 少しパディングを追加してROIを生成
+                pad_w = (box['x2'] - box['x1']) * 0.1
+                pad_h = (box['y2'] - box['y1']) * 0.1
+                predicted_rois.append({
+                    'x1': int(max(0, box['x1'] - pad_w)), 
+                    'y1': int(max(0, box['y1'] - pad_h)), 
+                    'x2': int(min(w - 1, box['x2'] + pad_w)), 
+                    'y2': int(min(h - 1, box['y2'] + pad_h)), 
+                    'depth': 5.0  # depthはダミー
+                })
+
+            # --- 2. レーダーROIと予測ROIを統合 ---
             t_roi_start = time.perf_counter()
+            radar_rois = []
             if USE_ROI:
-                rois = build_rois_from_radar(nusc, sample, cam_t, (w, h))
+                radar_rois = build_rois_from_radar(nusc, sample, cam_t, (w, h))
             t_roi_end = time.perf_counter()
-            # ROI生成にかかった時間をリストに追加 (ms)
             roi_gen_times.append((t_roi_end - t_roi_start) * 1000.0)
+            
+            combined_rois = radar_rois + predicted_rois
+            # (注: ここでは単純に結合していますが、重複除去処理を入れるとより良い)
 
-            if sample_idx_in_scene < 3 and USE_ROI:
-                px = sum((r["x2"]-r["x1"]) * (r["y2"]-r["y1"]) for r in rois) if rois else 0
-                d2(f"[dbg2/b5] scene={scene['name']} sample_idx={sample_idx_in_scene} "
-                   f"ROI_n={len(rois)} ROI_px%={int(px*100/(w*h)) if (w*h)>0 else 0}")
-
+            # ... (デバッグ出力など。rois変数をcombined_roisに置き換えるのを推奨) ...
+            
             # === このフレームのGT 2Dボックス蓄積（タイル評価用） ===
             gt2d_list = [] # このフレームの正解ボックスリスト
 
             # YOLO推論の時間を計測
             t_yolo_start = time.perf_counter()
-            yolo_boxes, used_full, used_roi_px = yolo_vehicle_detections_any(model, img, sample_idx_in_scene, rois, sweep_state)
+            yolo_boxes, used_full, used_roi_px = yolo_vehicle_detections_any(model, img, sample_idx_in_scene, combined_rois, sweep_state)
             t_yolo_end = time.perf_counter()
-            # YOLO推論（と関連処理）にかかった時間をリストに追加 (ms)
-            dt_ms = (t_yolo_end - t_yolo_start) * 1000.0
-            yolo_inf_times.append(dt_ms)
-            total_ms += dt_ms # 全体の合計時間も更新
+
+            # --- 4. 検出結果でTrackerを更新 ---
+            plain_boxes = [{"x1":b["x1"],"y1":b["y1"],"x2":b["x2"],"y2":b["y2"]} for b in yolo_boxes]
+            tracker.update(plain_boxes)
 
             if used_full:
                 total_full_calls += 1
