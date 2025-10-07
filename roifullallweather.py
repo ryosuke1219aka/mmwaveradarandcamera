@@ -944,7 +944,7 @@ class SimpleTracker:
         
         return self.tracks
     
-    def merge_overlapping_rois(rois, iou_threshold=0.5):
+def merge_overlapping_rois(rois, iou_threshold=0.5):
         if not rois:
             return []
     
@@ -968,7 +968,7 @@ class SimpleTracker:
             merged.append(current_roi)
             rois = remaining_rois
         
-        return merged
+        return merged    
 
 # ================== メイン ==================
 
