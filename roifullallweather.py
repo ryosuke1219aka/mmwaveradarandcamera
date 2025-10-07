@@ -2,6 +2,7 @@ import os, glob, math, time, traceback
 import numpy as np
 from types import MethodType
 from PIL import Image
+from PIL import ImageDraw
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.data_classes import RadarPointCloud
 from pyquaternion import Quaternion
