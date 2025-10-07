@@ -103,8 +103,8 @@ def _tiles_for_image(img_wh, gw=TILE_W, gh=TILE_H):
     return tiles, tw, th
 
 def _tile_index_for_point(x, y, w, h, gw=TILE_W, gh=TILE_H):
-    ix = min(gw-1, max(0, int((x / max(1e-6,w)) * gw))))
-    iy = min(gh-1, max(0, int((y / max(1e-6,h)) * gh))))
+    ix = min(gw-1, max(0, int((x / max(1e-6,w)) * gw)))
+    iy = min(gh-1, max(0, int((y / max(1e-6,h)) * gh)))
     return iy*gw + ix
 
 def _greedy_match_iou(gts, dets, thr=IOU_EVAL_THR):
