@@ -779,18 +779,20 @@ def yolo_vehicle_detections_roi_batched(model: YOLO, img_pil, rois, batch_size: 
         return yolo_vehicle_detections_roi(model, img_pil, rois)
 
 
+### 変更: 適応的フォールバックのロジックをより明確に実装 ###
 def yolo_vehicle_detections_any(model: YOLO, img_pil, sample_idx_in_scene, rois, state: "SceneSweepState"):
     """
-    Policy order:
-      1) ROIがあれば ROI 推論
-      2) ROIが無ければ coarse fallback（グリッド）で ROI 風推論
-      3) FULL_SWEEP_POLICY に応じてフルスイープ（none: しない / periodic / adaptive）
-    Returns: (detections, used_full: bool, roi_area_px: int)
+    適応的なフォールバック戦略を実行する。
+    1. 普段はレーダーROI（青枠）で高速に処理する。
+    2. レーダーROIの生成に失敗した場合（静止・遠距離など）、カウンターを増やす。
+    3. 失敗が一定回数続いたら、一度だけフル画像処理を実行して検出漏れをカバーする。
+    4. 1にも2にも当てはまらない場合は、最低限の保証として粗いグリッドで処理する。
     """
     w, h = img_pil.size
 
-    # Helper: run full-image inference (downscaled if needed)
+    # ヘルパー関数：フル画像処理（リサイズ付き）
     def _run_full():
+        d2(f"  [ADAPTIVE] Triggering full image sweep. (consecutive_roi_zero={state.consecutive_roi_zero})")
         if min(w, h) > FULL_SWEEP_SHORT_SIDE:
             if w < h:
                 new_w = FULL_SWEEP_SHORT_SIDE
@@ -798,57 +800,49 @@ def yolo_vehicle_detections_any(model: YOLO, img_pil, sample_idx_in_scene, rois,
             else:
                 new_h = FULL_SWEEP_SHORT_SIDE
                 new_w = int(w * (new_h / h))
-            img_small = img_pil.resize((new_w, new_h), Image.BILINEAR)
+            img_small = img_pil.resize((new_w, new_h), Image.Resampling.BILINEAR)
             outs_small = yolo_vehicle_detections_full(model, img_small)
             sx, sy = (w / new_w), (h / new_h)
-            outs = [{"x1": int(b["x1"]*sx), "y1": int(b["y1"]*sy), "x2": int(b["x2"]*sx), "y2": int(b["y2"]*sy)} for b in outs_small]
+            outs = [{"x1": int(b["x1"]*sx), "y1": int(b["y1"]*sy), "x2": int(b["x2"]*sx), "y2": int(b["y2"]*sy), "conf": b.get("conf", 0.0)} for b in outs_small]
         else:
             outs = yolo_vehicle_detections_full(model, img_pil)
         return outs
 
-    if not USE_ROI:
-        outs = _run_full()
-        state.frames_since_full = 0
-        return outs, True, 0
+    # --- メインロジック ---
 
-    # 1) Prefer radar ROIs
+    state.frames_since_full += 1  # 基本的にフル処理からのフレーム数は常に増やす
+
+    # --- 1. プライマリルート：レーダーROIが正常に生成された場合 ---
     if rois:
+        state.consecutive_roi_zero = 0  # 成功したので、連続失敗カウンターをリセット
         outs = yolo_vehicle_detections_roi_batched(model, img_pil, rois, ROI_BATCH_SIZE)
         roi_px = sum(max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"]) for r in rois)
-        state.frames_since_full += 1
-        state.consecutive_roi_zero = 0
         return outs, False, roi_px
 
-    # 2) No radar ROI -> build fallback tiles (slightly denser if long time since full)
-    grid_scale = 1.0 if state.frames_since_full < ADAPTIVE_FULL_MIN_GAP else 1.5
-    fallback_rois = build_coarse_fallback_rois((w, h), grid_scale=grid_scale)
-    # Apply ROI area budget to fallback tiles to avoid near-full-image coverage
+    # --- ここから下は、レーダーROIが0個だった場合の処理 ---
+    state.consecutive_roi_zero += 1  # 失敗したので、連続失敗カウンターを1増やす
+
+    # --- 2. 適応的フォールバック：フル画像処理を発動させるか判定 ---
+    do_full = False
+    if FULL_SWEEP_POLICY == 'adaptive':
+        if (state.consecutive_roi_zero >= ADAPTIVE_FULL_MISS_THRESH and
+            state.frames_since_full >= ADAPTIVE_FULL_MIN_GAP):
+            do_full = True
+    
+    if do_full:
+        outs_full = _run_full()
+        # フル処理を実行したので、両方のカウンターをリセット
+        state.frames_since_full = 0
+        state.consecutive_roi_zero = 0
+        return outs_full, True, (w * h) # 処理画素数は画像全体
+
+    # --- 3. 通常フォールバック：粗いグリッドで最低限の検出を試みる ---
+    # (レーダーROIが0個で、かつ適応的フル処理の条件も満たさなかった場合に実行される)
+    d2(f"  [Fallback] Using coarse grid. (consecutive_roi_zero={state.consecutive_roi_zero})")
+    fallback_rois = build_coarse_fallback_rois((w, h))
     fallback_rois = _apply_roi_budget(fallback_rois, w, h, ROI_AREA_BUDGET_RATIO, MAX_NUM_ROI)
     outs = yolo_vehicle_detections_roi_batched(model, img_pil, fallback_rois, ROI_BATCH_SIZE)
     roi_px = sum(max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"]) for r in fallback_rois)
-
-    # ヒットが無ければ「ROIゼロ」扱いでカウンタを進める
-    state.frames_since_full += 1
-    state.consecutive_roi_zero += 1
-
-    # 3) Check policy for full sweep
-    do_full = False
-    if FULL_SWEEP_POLICY == "none":
-        do_full = False
-    elif FULL_SWEEP_POLICY == "periodic":
-        do_full = (sample_idx_in_scene % max(1, FULL_SWEEP_EVERY) == 0)
-    elif FULL_SWEEP_POLICY == "adaptive":
-        do_full = (state.frames_since_full >= ADAPTIVE_FULL_MIN_GAP and
-                   state.consecutive_roi_zero >= ADAPTIVE_FULL_MISS_THRESH)
-    else:
-        do_full = False
-
-    if do_full:
-        outs_full = _run_full()
-        state.frames_since_full = 0
-        state.consecutive_roi_zero = 0
-        return outs_full, True, 0
-
     return outs, False, roi_px
 
 
