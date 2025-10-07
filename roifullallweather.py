@@ -1135,7 +1135,7 @@ def main():
                 'anns_vehicle': 0,
                 'gt2d_ok': 0,
                 'iou_hit': 0,
-                'n_roi': len(rois),
+                'n_roi': len(final_rois),
                 'used_full': used_full,
                 'inference_ms': int(dt_ms),
                 'roi_pixel_ratio_%': 0
