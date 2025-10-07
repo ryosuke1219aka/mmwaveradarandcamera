@@ -15,7 +15,7 @@ import argparse, csv, os
 # ==== BUILD MARKER / RUNTIME INFO ====
 import datetime, inspect, sys
 BUILD_ID = "gt2d-v5-roi-bev"
-YOLO_CONF = 0.10
+YOLO_CONF = 0.40
 print(f"### BUILD {BUILD_ID} ### __file__={__file__}  now={datetime.datetime.now().isoformat(timespec='seconds')}", flush=True)
 
 # ================== 設定 ==================
