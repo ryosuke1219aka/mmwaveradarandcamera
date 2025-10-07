@@ -1079,7 +1079,7 @@ def main():
                         pass
             
                         # === Box-level evaluation (per frame) ===
-            if gt2d_list is not None:
+            if gt2d_list:
                 det_boxes_plain = [{"x1":b["x1"],"y1":b["y1"],"x2":b["x2"],"y2":b["y2"]} for b in yolo_boxes]
                 tp_b, fp_b, fn_b = box_eval_counts(gt2d_list, det_boxes_plain, iou_thr=iou_eval_thr)
                 sum_box_tp += tp_b; sum_box_fp += fp_b; sum_box_fn += fn_b
