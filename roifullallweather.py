@@ -1090,7 +1090,7 @@ def main():
 
 
             # === タイルベース混同行列をフレーム単位で加算 ===
-            if gt2d_list is not None:
+            if gt2d_list:
                 tp_t, tn_t, fp_t, fn_t = confusion_tiles(gt2d_list, yolo_boxes, (w, h))
                 sum_tp += tp_t
                 sum_tn += tn_t
