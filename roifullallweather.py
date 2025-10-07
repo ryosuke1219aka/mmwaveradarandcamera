@@ -947,6 +947,32 @@ class SimpleTracker:
                 self.next_id += 1
         
         return self.tracks
+    
+    def merge_overlapping_rois(rois, iou_threshold=0.5):
+        if not rois:
+            return []
+    
+        # 面積の大きい順にソート
+        rois.sort(key=lambda r: (r['x2'] - r['x1']) * (r['y2'] - r['y1']), reverse=True)
+    
+        merged = []
+        while rois:
+            current_roi = rois.pop(0)
+            remaining_rois = []
+            for other_roi in rois:
+                iou = calculate_iou(current_roi, other_roi)
+                if iou > iou_threshold:
+                    # 重なっていたら統合
+                    current_roi['x1'] = min(current_roi['x1'], other_roi['x1'])
+                    current_roi['y1'] = min(current_roi['y1'], other_roi['y1'])
+                    current_roi['x2'] = max(current_roi['x2'], other_roi['x2'])
+                    current_roi['y2'] = max(current_roi['y2'], other_roi['y2'])
+                else:
+                    remaining_rois.append(other_roi)
+            merged.append(current_roi)
+            rois = remaining_rois
+        
+        return merged
 
 # ================== メイン ==================
 
@@ -1033,10 +1059,13 @@ def main():
         weather_scene_counts[wtag] = weather_scene_counts.get(wtag, 0) + 1
 
         token = scene["first_sample_token"]
-        vehicle_hist = {}  # instance_token -> {'first_radar_ts':None,'first_camera_ts':None}
+        vehicle_hist = {}
         start_scene = time.time()
         sample_idx_in_scene = 0
         sweep_state = SceneSweepState()
+        
+        ### 修正点1: シーンごとにTrackerを初期化 ###
+        tracker = SimpleTracker()
 
         while token:
             sample = nusc.get("sample", token)
@@ -1054,13 +1083,10 @@ def main():
             except Exception:
                 token = sample["next"]; continue
 
-            ### 変更: トラッキングを組み込んだROI生成とYOLO実行 ###
-
             # --- 1. 追跡情報から「予測ROI」を生成 ---
             predicted_rois = []
             for track in tracker.tracks:
                 box = track['box']
-                # 少しパディングを追加してROIを生成
                 pad_w = (box['x2'] - box['x1']) * 0.1
                 pad_h = (box['y2'] - box['y1']) * 0.1
                 predicted_rois.append({
@@ -1068,7 +1094,7 @@ def main():
                     'y1': int(max(0, box['y1'] - pad_h)), 
                     'x2': int(min(w - 1, box['x2'] + pad_w)), 
                     'y2': int(min(h - 1, box['y2'] + pad_h)), 
-                    'depth': 5.0  # depthはダミー
+                    'depth': 5.0
                 })
 
             # --- 2. レーダーROIと予測ROIを統合 ---
@@ -1080,17 +1106,19 @@ def main():
             roi_gen_times.append((t_roi_end - t_roi_start) * 1000.0)
             
             combined_rois = radar_rois + predicted_rois
-            # (注: ここでは単純に結合していますが、重複除去処理を入れるとより良い)
+            final_rois = merge_overlapping_rois(combined_rois) # 重複除去を実行
 
-            # ... (デバッグ出力など。rois変数をcombined_roisに置き換えるのを推奨) ...
-            
-            # === このフレームのGT 2Dボックス蓄積（タイル評価用） ===
-            gt2d_list = [] # このフレームの正解ボックスリスト
+            gt2d_list = []
 
-            # YOLO推論の時間を計測
+            # --- 3. 統合ROIでYOLOを実行 ---
             t_yolo_start = time.perf_counter()
             yolo_boxes, used_full, used_roi_px = yolo_vehicle_detections_any(model, img, sample_idx_in_scene, combined_rois, sweep_state)
             t_yolo_end = time.perf_counter()
+            
+            ### 修正点2: dt_msの計算とyolo_inf_timesへの追加 ###
+            dt_ms = (t_yolo_end - t_yolo_start) * 1000.0
+            yolo_inf_times.append(dt_ms)
+            total_ms += dt_ms
 
             # --- 4. 検出結果でTrackerを更新 ---
             plain_boxes = [{"x1":b["x1"],"y1":b["y1"],"x2":b["x2"],"y2":b["y2"]} for b in yolo_boxes]
@@ -1101,7 +1129,7 @@ def main():
                 total_px += (w * h)
             else:
                 total_roi_calls += 1
-                total_px += int(used_roi_px)
+                total_px += used_roi_px # used_roi_pxはyolo_vehicle_detections_anyから返される
 
             # === DEBUG counters ===
             dbg = {
