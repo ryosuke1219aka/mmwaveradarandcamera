@@ -1,7 +1,7 @@
 import os, glob, math, time, traceback
 import numpy as np
 from types import MethodType
-from PIL import Image
+from PIL import Image, ImageDraw ### 追加: 描画ライブラリ ###
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.data_classes import RadarPointCloud
 from pyquaternion import Quaternion
@@ -15,7 +15,7 @@ import argparse, csv, os
 # ==== BUILD MARKER / RUNTIME INFO ====
 import datetime, inspect, sys
 BUILD_ID = "gt2d-v5-roi-bev"
-YOLO_CONF = 0.10
+YOLO_CONF = 0.40 # 信頼度しきい値
 print(f"### BUILD {BUILD_ID} ### __file__={__file__}  now={datetime.datetime.now().isoformat(timespec='seconds')}", flush=True)
 
 # ================== 設定 ==================
@@ -34,6 +34,10 @@ PART_ROOTS = [
     "/Users/ryosukeakasaka/Documents/sensor/v1.0-trainval09_blobs",
     "/Users/ryosukeakasaka/Documents/sensor/v1.0-trainval10_blobs",
 ]
+
+### 追加: 失敗事例の可視化設定 ###
+SAVE_FAILURE_CASES = True  # Trueにすると検出漏れがあった画像を保存する
+SAVE_FAILURE_DIR = "failure_cases_viz" # 保存先フォルダ名
 
 # === 全天候設定（悪天候フィルタは無効化） ===
 BAD_WEATHER_KEYWORDS = ["rain", "snow", "storm", "wet", "sleet", "fog", "drizzle"]
@@ -906,6 +910,11 @@ def main():
     if args.roi_budget is not None:
         ROI_AREA_BUDGET_RATIO = max(0.0, min(1.0, args.roi_budget))
 
+    ### 追加: 失敗事例保存用のフォルダを作成 ###
+    if SAVE_FAILURE_CASES:
+        os.makedirs(SAVE_FAILURE_DIR, exist_ok=True)
+        print(f"[Info] Saving failure cases to '{SAVE_FAILURE_DIR}/'")
+
     print("[1/7] Load NuScenes...")
     nusc = NuScenes(version=NUSC_VERSION, dataroot=PRIMARY_DATAROOT, verbose=True)
     print("[2/7] Patch path resolver...")
@@ -945,7 +954,7 @@ def main():
     total_full_calls = 0
     total_roi_calls = 0
     
-    ### 追加: パフォーマンス計測用のリスト ###
+    # パフォーマンス計測用のリスト
     roi_gen_times = []
     yolo_inf_times = []
 
@@ -996,7 +1005,7 @@ def main():
             except Exception:
                 token = sample["next"]; continue
 
-            ### 変更: ROI生成の時間を計測 ###
+            # ROI生成の時間を計測
             rois = []
             t_roi_start = time.perf_counter()
             if USE_ROI:
@@ -1011,9 +1020,9 @@ def main():
                    f"ROI_n={len(rois)} ROI_px%={int(px*100/(w*h)) if (w*h)>0 else 0}")
 
             # === このフレームのGT 2Dボックス蓄積（タイル評価用） ===
-            gt2d_list = []
+            gt2d_list = [] # このフレームの正解ボックスリスト
 
-            ### 変更: YOLO推論の時間を計測 ###
+            # YOLO推論の時間を計測
             t_yolo_start = time.perf_counter()
             yolo_boxes, used_full, used_roi_px = yolo_vehicle_detections_any(model, img, sample_idx_in_scene, rois, sweep_state)
             t_yolo_end = time.perf_counter()
@@ -1025,9 +1034,6 @@ def main():
             if used_full:
                 total_full_calls += 1
                 total_px += (w * h)
-                # safety: already handled inside yolo_vehicle_detections_any, but keep consistent
-                # sweep_state.frames_since_full = 0
-                # sweep_state.consecutive_roi_zero = 0
             else:
                 total_roi_calls += 1
                 total_px += int(used_roi_px)
@@ -1047,7 +1053,7 @@ def main():
             if not used_full:
                 dbg['roi_pixel_ratio_%'] = int((used_roi_px * 100) / max(1, (w*h)))
 
-            # === 先行/同時の集計 ===
+            # === 先行/同時の集計 と GTボックスの取得 ===
             for ann_t in sample['anns']:
                 ann = nusc.get('sample_annotation', ann_t)
                 if 'vehicle' not in ann['category_name']:
@@ -1060,12 +1066,12 @@ def main():
                     npts = check_radar_in_box(nusc, sample, ann_t, nsweeps=NSWEEPS)
                     if npts >= RADAR_MIN_PTS:
                         rec['first_radar_ts'] = ts
-
-                if rec['first_camera_ts'] is None:
-                    gt2d = get_gt_2d_box(nusc, ann_t, cam_t, (w, h))
-                    if gt2d is not None:
-                        # タイル評価用に保持
-                        gt2d_list.append(gt2d)
+                
+                # このタイミングでGTボックスを取得し、gt2d_listに追加
+                gt2d = get_gt_2d_box(nusc, ann_t, cam_t, (w, h))
+                if gt2d is not None:
+                    gt2d_list.append(gt2d)
+                    if rec['first_camera_ts'] is None:
                         # 先行/同時の集計用ヒット判定
                         for det in yolo_boxes:
                             iou = calculate_iou(gt2d, det)
@@ -1074,12 +1080,9 @@ def main():
                                 dbg['iou_hit'] += 1
                                 rec['first_camera_ts'] = ts
                                 break
-                    else:
-                        # GTが2Dに投影できない場合はスキップ
-                        pass
-            
-                        # === Box-level evaluation (per frame) ===
-            if gt2d_list is not None:
+
+            # === Box-level evaluation (per frame) ===
+            if gt2d_list:
                 det_boxes_plain = [{"x1":b["x1"],"y1":b["y1"],"x2":b["x2"],"y2":b["y2"]} for b in yolo_boxes]
                 tp_b, fp_b, fn_b = box_eval_counts(gt2d_list, det_boxes_plain, iou_thr=iou_eval_thr)
                 sum_box_tp += tp_b; sum_box_fp += fp_b; sum_box_fn += fn_b
@@ -1088,9 +1091,34 @@ def main():
                 if args.eval_map:
                     pr_accumulate_frame(gt2d_list, yolo_boxes, iou_eval_thr, pr_scores, pr_is_tp, pr_total_gt)
 
+                ### 追加: 失敗事例の描画と保存 ###
+                if SAVE_FAILURE_CASES and fn_b > 0:
+                    # 検出漏れがあった場合のみ描画処理を行う
+                    draw_img = img.copy()
+                    draw = ImageDraw.Draw(draw_img)
+                    
+                    # 1. 正解(GT)の箱を描画 (緑色)
+                    for gt_box in gt2d_list:
+                        draw.rectangle([gt_box["x1"], gt_box["y1"], gt_box["x2"], gt_box["y2"]], outline="lime", width=3)
+                    
+                    # 2. 生成されたROIの箱を描画 (青色、点線風)
+                    if rois:
+                        for r_box in rois:
+                            # 点線はPIL標準では難しいため、幅を変えて区別
+                            draw.rectangle([r_box["x1"], r_box["y1"], r_box["x2"], r_box["y2"]], outline="blue", width=2)
+                    
+                    # 3. 検出された箱(YOLO)を描画 (赤色)
+                    for y_box in yolo_boxes:
+                        draw.rectangle([y_box["x1"], y_box["y1"], y_box["x2"], y_box["y2"]], outline="red", width=1)
+                    
+                    # ファイルに保存
+                    filename = f"{scene['name']}_{sample['token']}.jpg"
+                    filepath = os.path.join(SAVE_FAILURE_DIR, filename)
+                    draw_img.save(filepath)
+
 
             # === タイルベース混同行列をフレーム単位で加算 ===
-            if gt2d_list is not None:
+            if gt2d_list:
                 tp_t, tn_t, fp_t, fn_t = confusion_tiles(gt2d_list, yolo_boxes, (w, h))
                 sum_tp += tp_t
                 sum_tn += tn_t
@@ -1121,7 +1149,6 @@ def main():
               f"pairs={scene_pairs}  radar_first={sc_r}  cam_first={sc_c}  sim={sc_s}  time={elapsed}s")
 
     print("\n[6/7] Timing & Load Summary")
-    ### 変更: `total_ms` の平均計算部分を `yolo_inf_times` の平均に置き換え ###
     avg_total_inference_time = np.mean(yolo_inf_times) if yolo_inf_times else 0
     print(f"  avg_inference_time = {avg_total_inference_time:.1f} ms/frame")
     print(f"  calls: full={total_full_calls}  roi={total_roi_calls}")
@@ -1182,7 +1209,7 @@ def main():
         else:
             print("  (no detections or no GT; cannot compute PR)")
 
-    ### 追加: パフォーマンス計測結果の最終出力 ###
+    # パフォーマンス計測結果の最終出力
     print("\n[Appendix] Performance Profiling (avg per frame)")
     avg_roi_gen = np.mean(roi_gen_times) if roi_gen_times else 0
     avg_yolo_inf = np.mean(yolo_inf_times) if yolo_inf_times else 0
