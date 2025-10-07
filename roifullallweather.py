@@ -2,6 +2,7 @@ import os, glob, math, time, traceback
 import numpy as np
 from types import MethodType
 from PIL import Image
+from PIL import ImageDraw
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.data_classes import RadarPointCloud
 from pyquaternion import Quaternion
@@ -34,6 +35,16 @@ PART_ROOTS = [
     "/Users/ryosukeakasaka/Documents/sensor/v1.0-trainval09_blobs",
     "/Users/ryosukeakasaka/Documents/sensor/v1.0-trainval10_blobs",
 ]
+
+
+### 追加: 失敗分析用の設定 ###
+ANALYZE_FAILURES = True  # Trueにすると失敗分析CSVを生成する
+ANALYSIS_CSV_PATH = "failure_analysis.csv" # 分析結果を保存するCSVファイル名
+ROI_QUALITY_IOU_THRESH = 0.3 # GTとROIがこれ以上重なっていれば「質の良いROI」と判断
+
+### 追加: 失敗事例の可視化設定 ###
+SAVE_FAILURE_CASES = True  # Trueにすると検出漏れがあった画像を保存する
+SAVE_FAILURE_DIR = "failure_cases_viz" # 保存先フォルダ名
 
 # === 全天候設定（悪天候フィルタは無効化） ===
 BAD_WEATHER_KEYWORDS = ["rain", "snow", "storm", "wet", "sleet", "fog", "drizzle"]
@@ -926,6 +937,26 @@ def main():
         except Exception as _e:
             print(f"[warn] Could not move model to device '{args.device}': {_e}. Using default device.", flush=True)
 
+    ### 追加: 失敗分析CSVの準備 ###
+    csv_file = None
+    csv_writer = None
+    if ANALYZE_FAILURES:
+        csv_file = open(ANALYSIS_CSV_PATH, 'w', newline='', encoding='utf-8')
+        fieldnames = [
+            'scene_name', 'sample_token', 'failure_type', 
+            'num_gt', 'num_rois', 'missed_gt_count', 
+            'best_roi_iou_for_missed_gt'
+        ]
+        csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        csv_writer.writeheader()
+        print(f"[Info] Analyzing failures and saving results to '{ANALYSIS_CSV_PATH}'")
+
+    # 失敗事例保存用のフォルダを作成
+    if SAVE_FAILURE_CASES:
+        os.makedirs(SAVE_FAILURE_DIR, exist_ok=True)
+        print(f"[Info] Saving failure case images to '{SAVE_FAILURE_DIR}/'")
+
+
     # 結果集計用
     total_pairs = 0
     radar_first = 0
@@ -1088,6 +1119,73 @@ def main():
                 if args.eval_map:
                     pr_accumulate_frame(gt2d_list, yolo_boxes, iou_eval_thr, pr_scores, pr_is_tp, pr_total_gt)
 
+                ### 変更: 失敗分析と可視化のロジック ###
+                if (ANALYZE_FAILURES or SAVE_FAILURE_CASES) and fn_b > 0:
+                    
+                    # --- 失敗したGT(FN)を特定 ---
+                    matched_gt_indices, _, _ = _match_dets_to_gts_by_iou(gt2d_list, yolo_boxes, iou_eval_thr)
+                    missed_gt_boxes = [gt for i, gt in enumerate(gt2d_list) if i not in matched_gt_indices]
+
+                    analysis_result = {
+                        'scene_name': scene['name'],
+                        'sample_token': sample['token'],
+                        'num_gt': len(gt2d_list),
+                        'num_rois': len(rois),
+                        'missed_gt_count': len(missed_gt_boxes),
+                        'best_roi_iou_for_missed_gt': 0.0,
+                        'failure_type': 'N/A'
+                    }
+
+                    # --- 失敗原因を判定 ---
+                    if len(rois) == 0:
+                        analysis_result['failure_type'] = 'A_No_ROI'
+                    else:
+                        best_overall_iou = 0
+                        for missed_gt in missed_gt_boxes:
+                            max_iou_for_this_gt = 0
+                            for r in rois:
+                                iou = calculate_iou(missed_gt, r)
+                                if iou > max_iou_for_this_gt:
+                                    max_iou_for_this_gt = iou
+                            if max_iou_for_this_gt > best_overall_iou:
+                                best_overall_iou = max_iou_for_this_gt
+                        
+                        analysis_result['best_roi_iou_for_missed_gt'] = best_overall_iou
+
+                        if best_overall_iou < ROI_QUALITY_IOU_THRESH:
+                            analysis_result['failure_type'] = 'B_Poor_ROI_Quality'
+                        else:
+                            analysis_result['failure_type'] = 'C_YOLO_Detection_Failure'
+                    
+                    # --- CSVに書き込み ---
+                    if ANALYZE_FAILURES and csv_writer:
+                        csv_writer.writerow(analysis_result)
+
+                ### 追加: 失敗事例の描画と保存 ###
+                if SAVE_FAILURE_CASES and fn_b > 0:
+                    # 検出漏れがあった場合のみ描画処理を行う
+                    draw_img = img.copy()
+                    draw = ImageDraw.Draw(draw_img)
+                    
+                    # 1. 正解(GT)の箱を描画 (緑色)
+                    for gt_box in gt2d_list:
+                        draw.rectangle([gt_box["x1"], gt_box["y1"], gt_box["x2"], gt_box["y2"]], outline="lime", width=3)
+                    
+                    # 2. 生成されたROIの箱を描画 (青色、点線風)
+                    if rois:
+                        for r_box in rois:
+                            # 点線はPIL標準では難しいため、幅を変えて区別
+                            draw.rectangle([r_box["x1"], r_box["y1"], r_box["x2"], r_box["y2"]], outline="blue", width=2)
+                    
+                    # 3. 検出された箱(YOLO)を描画 (赤色)
+                    for y_box in yolo_boxes:
+                        draw.rectangle([y_box["x1"], y_box["y1"], y_box["x2"], y_box["y2"]], outline="red", width=1)
+                    
+                    # ファイルに保存
+                    filename = f"{scene['name']}_{sample['token']}.jpg"
+                    filepath = os.path.join(SAVE_FAILURE_DIR, filename)
+                    draw_img.save(filepath)
+
 
             # === タイルベース混同行列をフレーム単位で加算 ===
             if gt2d_list:
@@ -1119,6 +1217,11 @@ def main():
         elapsed = math.ceil(time.time() - start_scene)
         print(f"[scene {si}/{len(scenes)}] {scene['name']}: "
               f"pairs={scene_pairs}  radar_first={sc_r}  cam_first={sc_c}  sim={sc_s}  time={elapsed}s")
+        
+    ### 追加: CSVファイルを閉じる ###
+    if csv_file:
+        csv_file.close()
+        print(f"\n[Done] Failure analysis saved to '{ANALYSIS_CSV_PATH}'")
 
     print("\n[6/7] Timing & Load Summary")
     ### 変更: `total_ms` の平均計算部分を `yolo_inf_times` の平均に置き換え ###
