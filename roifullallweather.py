@@ -944,6 +944,11 @@ def main():
     total_px = 0         # 処理した総ピクセル数（ROIなら合計面積）
     total_full_calls = 0
     total_roi_calls = 0
+    
+    ### 追加: パフォーマンス計測用のリスト ###
+    roi_gen_times = []
+    yolo_inf_times = []
+
 
     # 天候別シーン数
     weather_scene_counts = {}
@@ -991,23 +996,31 @@ def main():
             except Exception:
                 token = sample["next"]; continue
 
-            # ---- ROI生成（必要時のみ）----
+            ### 変更: ROI生成の時間を計測 ###
             rois = []
+            t_roi_start = time.perf_counter()
             if USE_ROI:
                 rois = build_rois_from_radar(nusc, sample, cam_t, (w, h))
-                if sample_idx_in_scene < 3:
-                    px = sum((r["x2"]-r["x1"]) * (r["y2"]-r["y1"]) for r in rois) if rois else 0
-                    d2(f"[dbg2/b5] scene={scene['name']} sample_idx={sample_idx_in_scene} "
-                       f"ROI_n={len(rois)} ROI_px%={int(px*100/(w*h)) if (w*h)>0 else 0}")
+            t_roi_end = time.perf_counter()
+            # ROI生成にかかった時間をリストに追加 (ms)
+            roi_gen_times.append((t_roi_end - t_roi_start) * 1000.0)
+
+            if sample_idx_in_scene < 3 and USE_ROI:
+                px = sum((r["x2"]-r["x1"]) * (r["y2"]-r["y1"]) for r in rois) if rois else 0
+                d2(f"[dbg2/b5] scene={scene['name']} sample_idx={sample_idx_in_scene} "
+                   f"ROI_n={len(rois)} ROI_px%={int(px*100/(w*h)) if (w*h)>0 else 0}")
 
             # === このフレームのGT 2Dボックス蓄積（タイル評価用） ===
             gt2d_list = []
 
-            # ---- YOLO呼び出し（ROI/全体スイープ切替）----
-            t0 = time.perf_counter()
+            ### 変更: YOLO推論の時間を計測 ###
+            t_yolo_start = time.perf_counter()
             yolo_boxes, used_full, used_roi_px = yolo_vehicle_detections_any(model, img, sample_idx_in_scene, rois, sweep_state)
-            dt_ms = (time.perf_counter() - t0) * 1000.0
-            total_ms += dt_ms
+            t_yolo_end = time.perf_counter()
+            # YOLO推論（と関連処理）にかかった時間をリストに追加 (ms)
+            dt_ms = (t_yolo_end - t_yolo_start) * 1000.0
+            yolo_inf_times.append(dt_ms)
+            total_ms += dt_ms # 全体の合計時間も更新
 
             if used_full:
                 total_full_calls += 1
@@ -1108,7 +1121,9 @@ def main():
               f"pairs={scene_pairs}  radar_first={sc_r}  cam_first={sc_c}  sim={sc_s}  time={elapsed}s")
 
     print("\n[6/7] Timing & Load Summary")
-    print(f"  avg_inference_time = {total_ms / max(1,(total_full_calls+total_roi_calls)):.1f} ms/frame")
+    ### 変更: `total_ms` の平均計算部分を `yolo_inf_times` の平均に置き換え ###
+    avg_total_inference_time = np.mean(yolo_inf_times) if yolo_inf_times else 0
+    print(f"  avg_inference_time = {avg_total_inference_time:.1f} ms/frame")
     print(f"  calls: full={total_full_calls}  roi={total_roi_calls}")
     print(f"  processed_pixel_equiv = {total_px/1e6:.2f} MPix (sum, for rough compute proxy)")
 
@@ -1166,6 +1181,18 @@ def main():
                 print(f"   r={recalls[i]:.2f}  p={precisions[i]:.2f}")
         else:
             print("  (no detections or no GT; cannot compute PR)")
+
+    ### 追加: パフォーマンス計測結果の最終出力 ###
+    print("\n[Appendix] Performance Profiling (avg per frame)")
+    avg_roi_gen = np.mean(roi_gen_times) if roi_gen_times else 0
+    avg_yolo_inf = np.mean(yolo_inf_times) if yolo_inf_times else 0
+    
+    print(f"  ROI Generation Time : {avg_roi_gen:.2f} ms")
+    print(f"  YOLO Inference Time : {avg_yolo_inf:.2f} ms")
+    # USE_ROIがFalseの場合はROI生成時間は0なので、合計時間はYOLO推論時間と同じになる
+    if USE_ROI:
+        print(f"  ------------------------------------")
+        print(f"  Total (ROI Gen + YOLO): {avg_roi_gen + avg_yolo_inf:.2f} ms")
 
 
 if __name__ == "__main__":
