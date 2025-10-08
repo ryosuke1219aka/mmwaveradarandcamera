@@ -2,6 +2,7 @@ import os, glob, math, time, traceback
 import numpy as np
 from types import MethodType
 from PIL import Image
+from PIL import ImageDraw
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.data_classes import RadarPointCloud
 from pyquaternion import Quaternion
@@ -34,6 +35,16 @@ PART_ROOTS = [
     "/Users/ryosukeakasaka/Documents/sensor/v1.0-trainval09_blobs",
     "/Users/ryosukeakasaka/Documents/sensor/v1.0-trainval10_blobs",
 ]
+
+
+### 追加: 失敗分析用の設定 ###
+ANALYZE_FAILURES = True  # Trueにすると失敗分析CSVを生成する
+ANALYSIS_CSV_PATH = "failure_analysis.csv" # 分析結果を保存するCSVファイル名
+ROI_QUALITY_IOU_THRESH = 0.3 # GTとROIがこれ以上重なっていれば「質の良いROI」と判断
+
+### 追加: 失敗事例の可視化設定 ###
+SAVE_FAILURE_CASES = True  # Trueにすると検出漏れがあった画像を保存する
+SAVE_FAILURE_DIR = "failure_cases_viz" # 保存先フォルダ名
 
 # === 全天候設定（悪天候フィルタは無効化） ===
 BAD_WEATHER_KEYWORDS = ["rain", "snow", "storm", "wet", "sleet", "fog", "drizzle"]
@@ -768,18 +779,20 @@ def yolo_vehicle_detections_roi_batched(model: YOLO, img_pil, rois, batch_size: 
         return yolo_vehicle_detections_roi(model, img_pil, rois)
 
 
+### 変更: 適応的フォールバックのロジックをより明確に実装 ###
 def yolo_vehicle_detections_any(model: YOLO, img_pil, sample_idx_in_scene, rois, state: "SceneSweepState"):
     """
-    Policy order:
-      1) ROIがあれば ROI 推論
-      2) ROIが無ければ coarse fallback（グリッド）で ROI 風推論
-      3) FULL_SWEEP_POLICY に応じてフルスイープ（none: しない / periodic / adaptive）
-    Returns: (detections, used_full: bool, roi_area_px: int)
+    適応的なフォールバック戦略を実行する。
+    1. 普段はレーダーROI（青枠）で高速に処理する。
+    2. レーダーROIの生成に失敗した場合（静止・遠距離など）、カウンターを増やす。
+    3. 失敗が一定回数続いたら、一度だけフル画像処理を実行して検出漏れをカバーする。
+    4. 1にも2にも当てはまらない場合は、最低限の保証として粗いグリッドで処理する。
     """
     w, h = img_pil.size
 
-    # Helper: run full-image inference (downscaled if needed)
+    # ヘルパー関数：フル画像処理（リサイズ付き）
     def _run_full():
+        d2(f"  [ADAPTIVE] Triggering full image sweep. (consecutive_roi_zero={state.consecutive_roi_zero})")
         if min(w, h) > FULL_SWEEP_SHORT_SIDE:
             if w < h:
                 new_w = FULL_SWEEP_SHORT_SIDE
@@ -787,57 +800,50 @@ def yolo_vehicle_detections_any(model: YOLO, img_pil, sample_idx_in_scene, rois,
             else:
                 new_h = FULL_SWEEP_SHORT_SIDE
                 new_w = int(w * (new_h / h))
-            img_small = img_pil.resize((new_w, new_h), Image.BILINEAR)
+            img_small = img_pil.resize((new_w, new_h), Image.Resampling.BILINEAR)
             outs_small = yolo_vehicle_detections_full(model, img_small)
             sx, sy = (w / new_w), (h / new_h)
-            outs = [{"x1": int(b["x1"]*sx), "y1": int(b["y1"]*sy), "x2": int(b["x2"]*sx), "y2": int(b["y2"]*sy)} for b in outs_small]
+            outs = [{"x1": int(b["x1"]*sx), "y1": int(b["y1"]*sy), "x2": int(b["x2"]*sx), "y2": int(b["y2"]*sy), "conf": b.get("conf", 0.0)} for b in outs_small]
         else:
             outs = yolo_vehicle_detections_full(model, img_pil)
         return outs
 
-    if not USE_ROI:
-        outs = _run_full()
-        state.frames_since_full = 0
-        return outs, True, 0
+    # --- メインロジック ---
 
-    # 1) Prefer radar ROIs
+    state.frames_since_full += 1  # 基本的にフル処理からのフレーム数は常に増やす
+
+    # --- 1. プライマリルート：レーダーROIが正常に生成された場合 ---
     if rois:
+        state.consecutive_roi_zero = 0  # 成功したので、連続失敗カウンターをリセット
         outs = yolo_vehicle_detections_roi_batched(model, img_pil, rois, ROI_BATCH_SIZE)
         roi_px = sum(max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"]) for r in rois)
-        state.frames_since_full += 1
-        state.consecutive_roi_zero = 0
         return outs, False, roi_px
 
-    # 2) No radar ROI -> build fallback tiles (slightly denser if long time since full)
-    grid_scale = 1.0 if state.frames_since_full < ADAPTIVE_FULL_MIN_GAP else 1.5
-    fallback_rois = build_coarse_fallback_rois((w, h), grid_scale=grid_scale)
-    # Apply ROI area budget to fallback tiles to avoid near-full-image coverage
-    fallback_rois = _apply_roi_budget(fallback_rois, w, h, ROI_AREA_BUDGET_RATIO, MAX_NUM_ROI)
-    outs = yolo_vehicle_detections_roi_batched(model, img_pil, fallback_rois, ROI_BATCH_SIZE)
-    roi_px = sum(max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"]) for r in fallback_rois)
+    # --- ここから下は、レーダーROIが0個だった場合の処理 ---
+    state.consecutive_roi_zero += 1  # 失敗したので、連続失敗カウンターを1増やす
 
-    # ヒットが無ければ「ROIゼロ」扱いでカウンタを進める
-    state.frames_since_full += 1
-    state.consecutive_roi_zero += 1
-
-    # 3) Check policy for full sweep
+    # --- 2. 適応的フォールバック：フル画像処理を発動させるか判定 ---
     do_full = False
-    if FULL_SWEEP_POLICY == "none":
-        do_full = False
+    if FULL_SWEEP_POLICY == 'adaptive':
+        do_full = (state.consecutive_roi_zero >= ADAPTIVE_FULL_MISS_THRESH and
+                   state.frames_since_full >= ADAPTIVE_FULL_MIN_GAP)
     elif FULL_SWEEP_POLICY == "periodic":
         do_full = (sample_idx_in_scene % max(1, FULL_SWEEP_EVERY) == 0)
-    elif FULL_SWEEP_POLICY == "adaptive":
-        do_full = (state.frames_since_full >= ADAPTIVE_FULL_MIN_GAP and
-                   state.consecutive_roi_zero >= ADAPTIVE_FULL_MISS_THRESH)
-    else:
-        do_full = False
 
     if do_full:
         outs_full = _run_full()
+        # フル処理を実行したので、両方のカウンターをリセット
         state.frames_since_full = 0
         state.consecutive_roi_zero = 0
-        return outs_full, True, 0
+        return outs_full, True, (w * h) # 処理画素数は画像全体
 
+    # --- 3. 通常フォールバック：粗いグリッドで最低限の検出を試みる ---
+    # (レーダーROIが0個で、かつ適応的フル処理の条件も満たさなかった場合に実行される)
+    d2(f"  [Fallback] Using coarse grid. (consecutive_roi_zero={state.consecutive_roi_zero})")
+    fallback_rois = build_coarse_fallback_rois((w, h))
+    fallback_rois = _apply_roi_budget(fallback_rois, w, h, ROI_AREA_BUDGET_RATIO, MAX_NUM_ROI)
+    outs = yolo_vehicle_detections_roi_batched(model, img_pil, fallback_rois, ROI_BATCH_SIZE)
+    roi_px = sum(max(0, r["x2"]-r["x1"]) * max(0, r["y2"]-r["y1"]) for r in fallback_rois)
     return outs, False, roi_px
 
 
@@ -1003,6 +1009,26 @@ def main():
             model.to(args.device)
         except Exception as _e:
             print(f"[warn] Could not move model to device '{args.device}': {_e}. Using default device.", flush=True)
+
+    ### 追加: 失敗分析CSVの準備 ###
+    csv_file = None
+    csv_writer = None
+    if ANALYZE_FAILURES:
+        csv_file = open(ANALYSIS_CSV_PATH, 'w', newline='', encoding='utf-8')
+        fieldnames = [
+            'scene_name', 'sample_token', 'failure_type', 
+            'num_gt', 'num_rois', 'missed_gt_count', 
+            'best_roi_iou_for_missed_gt'
+        ]
+        csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        csv_writer.writeheader()
+        print(f"[Info] Analyzing failures and saving results to '{ANALYSIS_CSV_PATH}'")
+
+    # 失敗事例保存用のフォルダを作成
+    if SAVE_FAILURE_CASES:
+        os.makedirs(SAVE_FAILURE_DIR, exist_ok=True)
+        print(f"[Info] Saving failure case images to '{SAVE_FAILURE_DIR}/'")
+
 
     # 結果集計用
     total_pairs = 0
@@ -1187,6 +1213,73 @@ def main():
                 if args.eval_map:
                     pr_accumulate_frame(gt2d_list, yolo_boxes, iou_eval_thr, pr_scores, pr_is_tp, pr_total_gt)
 
+                ### 変更: 失敗分析と可視化のロジック ###
+                if (ANALYZE_FAILURES or SAVE_FAILURE_CASES) and fn_b > 0:
+                    
+                    # --- 失敗したGT(FN)を特定 ---
+                    matched_gt_indices, _, _ = _match_dets_to_gts_by_iou(gt2d_list, yolo_boxes, iou_eval_thr)
+                    missed_gt_boxes = [gt for i, gt in enumerate(gt2d_list) if i not in matched_gt_indices]
+
+                    analysis_result = {
+                        'scene_name': scene['name'],
+                        'sample_token': sample['token'],
+                        'num_gt': len(gt2d_list),
+                        'num_rois': len(rois),
+                        'missed_gt_count': len(missed_gt_boxes),
+                        'best_roi_iou_for_missed_gt': 0.0,
+                        'failure_type': 'N/A'
+                    }
+
+                    # --- 失敗原因を判定 ---
+                    if len(rois) == 0:
+                        analysis_result['failure_type'] = 'A_No_ROI'
+                    else:
+                        best_overall_iou = 0
+                        for missed_gt in missed_gt_boxes:
+                            max_iou_for_this_gt = 0
+                            for r in rois:
+                                iou = calculate_iou(missed_gt, r)
+                                if iou > max_iou_for_this_gt:
+                                    max_iou_for_this_gt = iou
+                            if max_iou_for_this_gt > best_overall_iou:
+                                best_overall_iou = max_iou_for_this_gt
+                        
+                        analysis_result['best_roi_iou_for_missed_gt'] = best_overall_iou
+
+                        if best_overall_iou < ROI_QUALITY_IOU_THRESH:
+                            analysis_result['failure_type'] = 'B_Poor_ROI_Quality'
+                        else:
+                            analysis_result['failure_type'] = 'C_YOLO_Detection_Failure'
+                    
+                    # --- CSVに書き込み ---
+                    if ANALYZE_FAILURES and csv_writer:
+                        csv_writer.writerow(analysis_result)
+
+                ### 追加: 失敗事例の描画と保存 ###
+                if SAVE_FAILURE_CASES and fn_b > 0:
+                    # 検出漏れがあった場合のみ描画処理を行う
+                    draw_img = img.copy()
+                    draw = ImageDraw.Draw(draw_img)
+                    
+                    # 1. 正解(GT)の箱を描画 (緑色)
+                    for gt_box in gt2d_list:
+                        draw.rectangle([gt_box["x1"], gt_box["y1"], gt_box["x2"], gt_box["y2"]], outline="lime", width=3)
+                    
+                    # 2. 生成されたROIの箱を描画 (青色、点線風)
+                    if rois:
+                        for r_box in rois:
+                            # 点線はPIL標準では難しいため、幅を変えて区別
+                            draw.rectangle([r_box["x1"], r_box["y1"], r_box["x2"], r_box["y2"]], outline="blue", width=2)
+                    
+                    # 3. 検出された箱(YOLO)を描画 (赤色)
+                    for y_box in yolo_boxes:
+                        draw.rectangle([y_box["x1"], y_box["y1"], y_box["x2"], y_box["y2"]], outline="red", width=1)
+                    
+                    # ファイルに保存
+                    filename = f"{scene['name']}_{sample['token']}.jpg"
+                    filepath = os.path.join(SAVE_FAILURE_DIR, filename)
+                    draw_img.save(filepath)
+
 
             # === タイルベース混同行列をフレーム単位で加算 ===
             if gt2d_list:
@@ -1218,6 +1311,11 @@ def main():
         elapsed = math.ceil(time.time() - start_scene)
         print(f"[scene {si}/{len(scenes)}] {scene['name']}: "
               f"pairs={scene_pairs}  radar_first={sc_r}  cam_first={sc_c}  sim={sc_s}  time={elapsed}s")
+        
+    ### 追加: CSVファイルを閉じる ###
+    if csv_file:
+        csv_file.close()
+        print(f"\n[Done] Failure analysis saved to '{ANALYSIS_CSV_PATH}'")
 
     print("\n[6/7] Timing & Load Summary")
     ### 変更: `total_ms` の平均計算部分を `yolo_inf_times` の平均に置き換え ###
