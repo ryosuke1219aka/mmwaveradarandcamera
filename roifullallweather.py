@@ -945,30 +945,33 @@ class SimpleTracker:
         return self.tracks
     
 def merge_overlapping_rois(rois, iou_threshold=0.5):
-        if not rois:
-            return []
+    if not rois:
+        return []
+
+    # 面積の大きい順にソート
+    rois.sort(key=lambda r: (r['x2'] - r['x1']) * (r['y2'] - r['y1']), reverse=True)
+
+    from collections import deque
+    rois_deque = deque(rois)
+
+    merged = []
+    while rois_deque:
+        current_roi = rois_deque.popleft()
+        remaining_rois = deque()
+        for other_roi in rois_deque:
+            iou = calculate_iou(current_roi, other_roi)
+            if iou > iou_threshold:
+                # 重なっていたら統合
+                current_roi['x1'] = min(current_roi['x1'], other_roi['x1'])
+                current_roi['y1'] = min(current_roi['y1'], other_roi['y1'])
+                current_roi['x2'] = max(current_roi['x2'], other_roi['x2'])
+                current_roi['y2'] = max(current_roi['y2'], other_roi['y2'])
+            else:
+                remaining_rois.append(other_roi)
+        merged.append(current_roi)
+        rois_deque = remaining_rois
     
-        # 面積の大きい順にソート
-        rois.sort(key=lambda r: (r['x2'] - r['x1']) * (r['y2'] - r['y1']), reverse=True)
-    
-        merged = []
-        while rois:
-            current_roi = rois.pop(0)
-            remaining_rois = []
-            for other_roi in rois:
-                iou = calculate_iou(current_roi, other_roi)
-                if iou > iou_threshold:
-                    # 重なっていたら統合
-                    current_roi['x1'] = min(current_roi['x1'], other_roi['x1'])
-                    current_roi['y1'] = min(current_roi['y1'], other_roi['y1'])
-                    current_roi['x2'] = max(current_roi['x2'], other_roi['x2'])
-                    current_roi['y2'] = max(current_roi['y2'], other_roi['y2'])
-                else:
-                    remaining_rois.append(other_roi)
-            merged.append(current_roi)
-            rois = remaining_rois
-        
-        return merged    
+    return merged
 
 # ================== メイン ==================
 
@@ -1106,7 +1109,7 @@ def main():
 
             ### 変更: YOLO推論の時間を計測 ###
             t_yolo_start = time.perf_counter()
-            yolo_boxes, used_full, used_roi_px = yolo_vehicle_detections_any(model, img, sample_idx_in_scene, combined_rois, sweep_state)
+            yolo_boxes, used_full, used_roi_px = yolo_vehicle_detections_any(model, img, sample_idx_in_scene, final_rois, sweep_state)
             t_yolo_end = time.perf_counter()
             
             ### 修正点2: dt_msの計算とyolo_inf_timesへの追加 ###
