@@ -1224,20 +1224,20 @@ def main():
                         'scene_name': scene['name'],
                         'sample_token': sample['token'],
                         'num_gt': len(gt2d_list),
-                        'num_rois': len(rois),
+                        'num_rois': len(final_rois),
                         'missed_gt_count': len(missed_gt_boxes),
                         'best_roi_iou_for_missed_gt': 0.0,
                         'failure_type': 'N/A'
                     }
 
                     # --- 失敗原因を判定 ---
-                    if len(rois) == 0:
+                    if len(final_rois) == 0:
                         analysis_result['failure_type'] = 'A_No_ROI'
                     else:
                         best_overall_iou = 0
                         for missed_gt in missed_gt_boxes:
                             max_iou_for_this_gt = 0
-                            for r in rois:
+                            for r in final_rois:
                                 iou = calculate_iou(missed_gt, r)
                                 if iou > max_iou_for_this_gt:
                                     max_iou_for_this_gt = iou
@@ -1266,8 +1266,8 @@ def main():
                         draw.rectangle([gt_box["x1"], gt_box["y1"], gt_box["x2"], gt_box["y2"]], outline="lime", width=3)
                     
                     # 2. 生成されたROIの箱を描画 (青色、点線風)
-                    if rois:
-                        for r_box in rois:
+                    if final_rois:
+                        for r_box in final_rois:
                             # 点線はPIL標準では難しいため、幅を変えて区別
                             draw.rectangle([r_box["x1"], r_box["y1"], r_box["x2"], r_box["y2"]], outline="blue", width=2)
                     
