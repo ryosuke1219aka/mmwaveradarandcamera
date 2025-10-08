@@ -825,10 +825,11 @@ def yolo_vehicle_detections_any(model: YOLO, img_pil, sample_idx_in_scene, rois,
     # --- 2. 適応的フォールバック：フル画像処理を発動させるか判定 ---
     do_full = False
     if FULL_SWEEP_POLICY == 'adaptive':
-        if (state.consecutive_roi_zero >= ADAPTIVE_FULL_MISS_THRESH and
-            state.frames_since_full >= ADAPTIVE_FULL_MIN_GAP):
-            do_full = True
-    
+        do_full = (state.consecutive_roi_zero >= ADAPTIVE_FULL_MISS_THRESH and
+                   state.frames_since_full >= ADAPTIVE_FULL_MIN_GAP)
+    elif FULL_SWEEP_POLICY == "periodic":
+        do_full = (sample_idx_in_scene % max(1, FULL_SWEEP_EVERY) == 0)
+
     if do_full:
         outs_full = _run_full()
         # フル処理を実行したので、両方のカウンターをリセット
