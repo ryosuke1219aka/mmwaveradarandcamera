@@ -1194,7 +1194,7 @@ def main():
                 sum_fn += fn_t
 
             if sample_idx_in_scene < 3:
-                mode = "FULL" if used_full else f"ROI(n={len(rois)}, {dbg['roi_pixel_ratio_%']}%)"
+                mode = "FULL" if used_full else f"ROI(n={len(final_rois)}, {dbg['roi_pixel_ratio_%']}%)"
                 print(f"  [dbg] {mode}  time={dbg['inference_ms']}ms  yolo={dbg['yolo']}  anns={dbg['anns_total']} veh={dbg['anns_vehicle']} gt2d_ok={dbg['gt2d_ok']} iou_hit={dbg['iou_hit']}")
             sample_idx_in_scene += 1
             token = sample["next"]
