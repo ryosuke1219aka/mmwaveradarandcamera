@@ -1,0 +1,37 @@
+graph TD
+    A[Start] --> B[初期化: データセット, YOLOモデル読込];
+    B --> C{シーンループ: for scene in scenes};
+    C --> D{サンプルループ: for frame in scene};
+    D --> E[1. レーダー点群をカメラ画像へ投影];
+    E --> F[2. 投影点からROI(注目領域)を生成];
+    F --> G{ROIは生成されたか？};
+
+    subgraph "3. YOLO推論 (状況に応じてモード切替)"
+        G -->|Yes| H["✅ ROIモード: ROI切抜きでYOLO実行 (高速)"];
+        G -->|No| I{"🤔 適応的フルスキャンを実行するか？ (ROI無しが続いた等)"};
+        I -->|Yes| J["🔥 フルスキャンモード: 画像全体でYOLO実行 (低速)"];
+        I -->|No| K["⚠️ フォールバックモード: 粗いグリッドでYOLO実行"];
+    end
+
+    H --> L[検出結果を統合];
+    J --> L;
+    K --> L;
+
+    L --> M[4. 正解データ(Ground Truth)を取得];
+    M --> N[5. YOLOの検出結果と正解を比較・評価];
+    N --> O{検出漏れ(FN)はあったか？};
+    O -->|Yes| P[失敗原因を分析 (ROIの質 or YOLOの問題)];
+    P --> Q[分析結果をCSV記録 & 失敗画像を保存];
+    Q --> R{次のサンプルはあるか？};
+
+    O -->|No| R;
+
+    R -->|Yes| D;
+    R -->|No| S{次のシーンはあるか？};
+    S -->|Yes| C;
+    S -->|No| T[最終結果を集計・レポート表示];
+    T --> U[End];
+
+    style H fill:#e6ffed,stroke:#333,stroke-width:2px
+    style J fill:#ffe6e6,stroke:#333,stroke-width:2px
+    style K fill:#fff7e6,stroke:#333,stroke-width:2px
