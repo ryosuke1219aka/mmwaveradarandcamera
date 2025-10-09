@@ -48,7 +48,7 @@ SAVE_FAILURE_DIR = "failure_cases_viz" # 保存先フォルダ名
 
 # === 全天候設定（悪天候フィルタは無効化） ===
 BAD_WEATHER_KEYWORDS = ["rain", "snow", "storm", "wet", "sleet", "fog", "drizzle"]
-USE_BAD_WEATHER_ONLY = False   # 全天候で処理
+USE_BAD_WEATHER_ONLY = True   # 悪天候のみ処理
 
 # マッチング＆検出条件
 IOU_THRESH = 0.10
