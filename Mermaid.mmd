@@ -3,7 +3,7 @@ graph TD
     B --> C{シーンループ: for scene in scenes};
     C --> D{サンプルループ: for frame in scene};
     D --> E[1. レーダー点群をカメラ画像へ投影];
-    E --> F[2. 投影点からROI(注目領域)を生成];
+    E --> F[2. 投影点からROI注目領域を生成];
     F --> G{ROIは生成されたか？};
 
     subgraph "3. YOLO推論 (状況に応じてモード切替)"
@@ -17,10 +17,10 @@ graph TD
     J --> L;
     K --> L;
 
-    L --> M[4. 正解データ(Ground Truth)を取得];
+    L --> M[4. 正解データGround Truthを取得];
     M --> N[5. YOLOの検出結果と正解を比較・評価];
-    N --> O{検出漏れ(FN)はあったか？};
-    O -->|Yes| P[失敗原因を分析 (ROIの質 or YOLOの問題)];
+    N --> O{検出漏れFNはあったか？};
+    O -->|Yes| P[失敗原因を分析 ROIの質 or YOLOの問題];
     P --> Q[分析結果をCSV記録 & 失敗画像を保存];
     Q --> R{次のサンプルはあるか？};
 
