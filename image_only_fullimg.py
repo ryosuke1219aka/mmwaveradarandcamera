@@ -33,7 +33,7 @@ PART_ROOTS = [
 
 # 全天候（ROI版と合わせて、悪天候制限はデフォ無効）
 BAD_WEATHER_KEYWORDS = ["rain", "snow", "storm", "wet", "sleet", "fog", "drizzle"]
-USE_BAD_WEATHER_ONLY = False
+USE_BAD_WEATHER_ONLY = True
 
 # モデル・クラスなど
 YOLO_MODEL = "yolov8n.pt"
