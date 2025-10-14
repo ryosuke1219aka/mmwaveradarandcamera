@@ -1,6 +1,7 @@
 # 生成された分析結果や画像を無視する
 failure_cases_viz/
 failure_analysis.csv
+success_cases_viz/
 
 # Pythonが自動生成するキャッシュファイル
 __pycache__/
