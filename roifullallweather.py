@@ -46,6 +46,11 @@ ROI_QUALITY_IOU_THRESH = 0.3 # GTとROIがこれ以上重なっていれば「�
 SAVE_FAILURE_CASES = True  # Trueにすると検出漏れがあった画像を保存する
 SAVE_FAILURE_DIR = "failure_cases_viz" # 保存先フォルダ名
 
+### 追加: 成功事例の可視化設定 ###
+# ROI生成が成功し、かつ検出漏れ(FN)がないフレームを保存
+SAVE_SUCCESS_CASES = True
+SAVE_SUCCESS_DIR = "success_cases_viz"
+
 # === 全天候設定（悪天候フィルタは無効化） ===
 BAD_WEATHER_KEYWORDS = ["rain", "snow", "storm", "wet", "sleet", "fog", "drizzle"]
 USE_BAD_WEATHER_ONLY = False   # 全天候で処理
@@ -951,6 +956,11 @@ def main():
         os.makedirs(SAVE_FAILURE_DIR, exist_ok=True)
         print(f"[Info] Saving failure case images to '{SAVE_FAILURE_DIR}/'")
 
+    # 成功事例保存用のフォルダを作成
+    if SAVE_SUCCESS_CASES:
+        os.makedirs(SAVE_SUCCESS_DIR, exist_ok=True)
+        print(f"[Info] Saving success case images to '{SAVE_SUCCESS_DIR}/'")
+
 
     # 結果集計用
     total_pairs = 0
@@ -1180,6 +1190,29 @@ def main():
                     filename = f"{scene['name']}_{sample['token']}.jpg"
                     filepath = os.path.join(SAVE_FAILURE_DIR, filename)
                     draw_img.save(filepath)
+
+                ### 追加: 成功事例の描画と保存（ROI成功かつ検出漏れなし） ###
+                # 成功判定: ROIが1つ以上あり、GTが存在し、かつFNが0（=全GTが検出にマッチ）
+                if SAVE_SUCCESS_CASES and fn_b == 0 and len(gt2d_list) > 0 and len(yolo_boxes) > 0 and len(rois) > 0:
+                    draw_img_ok = img.copy()
+                    draw_ok = ImageDraw.Draw(draw_img_ok)
+
+                    # 1. 正解(GT)の箱を描画 (緑色/太め)
+                    for gt_box in gt2d_list:
+                        draw_ok.rectangle([gt_box["x1"], gt_box["y1"], gt_box["x2"], gt_box["y2"]], outline="lime", width=3)
+
+                    # 2. 採用されたROIの箱を描画 (青色)
+                    for r_box in rois:
+                        draw_ok.rectangle([r_box["x1"], r_box["y1"], r_box["x2"], r_box["y2"]], outline="blue", width=2)
+
+                    # 3. 検出された箱(YOLO)を描画 (赤色/細め)
+                    for y_box in yolo_boxes:
+                        draw_ok.rectangle([y_box["x1"], y_box["y1"], y_box["x2"], y_box["y2"]], outline="red", width=1)
+
+                    # ファイルに保存（成功用ディレクトリへ）
+                    ok_filename = f"{scene['name']}_{sample['token']}.jpg"
+                    ok_filepath = os.path.join(SAVE_SUCCESS_DIR, ok_filename)
+                    draw_img_ok.save(ok_filepath)
 
 
             # === タイルベース混同行列をフレーム単位で加算 ===
